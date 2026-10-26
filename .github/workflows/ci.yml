@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows MSVC
+            os: windows-latest
+          - name: Linux Clang
+            os: ubuntu-latest
+            cc: clang
+            cxx: clang++
+          - name: macOS ARM64 Clang
+            os: macos-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - name: Configure
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.cc }}" ]; then export CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}; fi
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build
+      - name: Test (no audio device)
+        run: ctest --test-dir build --output-on-failure
