@@ -54,6 +54,13 @@ struct EventDef {
     float subtitleSeconds = 2.5f;
 };
 
+// 버스 정의 (이벤트 파일의 "mixbus <이름>"). 정의하지 않은 버스 이름은 master 아래에 볼륨 1로 생긴다
+struct BusDef {
+    std::string name;
+    std::string parent = "master";
+    float volume = 1.0f; // 믹스 볼륨 (사운드 디자이너). 플레이어 볼륨(setBusVolume)과 곱해진다
+};
+
 struct Param {
     const char* name;
     float value;
@@ -93,8 +100,10 @@ struct CullInfo {
 };
 struct BusInfo {
     std::string name;
-    float volume = 1.0f;
-    float peak = 0.0f; // 최근 출력 최댓값 (0..1+)
+    float volume = 1.0f; // 플레이어 볼륨 (setBusVolume)
+    float peak = 0.0f;   // 최근 출력 최댓값 (0..1+)
+    float mix = 1.0f;    // 믹스 볼륨 (BusDef)
+    std::string parent;  // master는 비어 있다
 };
 // 자막이 있는 소리가 났다 (같은 키는 한 줄로 합치고 시간을 늘린다)
 struct Subtitle {
@@ -124,6 +133,8 @@ public:
     // 이벤트 정의를 바꾼다 (처음, 그리고 정의 파일이 바뀔 때). 쿨다운·직전 클립은 이름으로 이어 가고,
     // 재생 중인 소리는 이름으로 새 정의를 찾는다(없어진 이벤트는 멈춘다). 메모리에 풀 클립은 여기서 푼다
     void setEvents(std::vector<EventDef> events);
+    // 버스 정의를 바꾼다 (부모·믹스 볼륨). 없는 버스는 만든다. 부모가 돌고 돌면 master 아래로
+    void setBuses(const std::vector<BusDef>& buses);
 
     // 재생 요청. 실제 시작은 update()에서 (같은 프레임에 같은 이벤트가 여러 번이면 상한만큼, 세기 큰 순)
     Handle play(std::string_view event, Vec3 position, std::initializer_list<Param> params = {});

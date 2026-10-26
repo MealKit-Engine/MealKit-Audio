@@ -71,7 +71,9 @@ struct Bus {
     std::string name;
     ma_sound_group group;
     MeterNode meter;
-    float volume = 1.0f;
+    float volume = 1.0f; // 플레이어 볼륨
+    float mix = 1.0f;    // 믹스 볼륨 (BusDef)
+    uint32_t parent = 0; // master(0)는 자기 자신
 };
 
 struct Clip {
@@ -175,6 +177,30 @@ struct Mixer::Impl {
         }
         buses.push_back(std::move(b));
         return static_cast<uint32_t>(buses.size() - 1);
+    }
+
+    void applyBusVolume(Bus& b) { ma_sound_group_set_volume(&b.group, b.volume * b.mix); }
+
+    void setBuses(const std::vector<BusDef>& defs) {
+        for (const BusDef& d : defs) {
+            if (d.name.empty()) continue;
+            const uint32_t index = bus(d.name);
+            Bus& b = *buses[index];
+            b.mix = std::max(d.volume, 0.0f);
+            applyBusVolume(b);
+            if (index == 0) continue; // master는 맨 위
+            uint32_t parent = bus(d.parent.empty() ? "master" : d.parent);
+            for (uint32_t p = parent; p != 0; p = buses[p]->parent) // 부모를 따라가다 자기가 나오면 돌고 돈다
+                if (p == index) {
+                    log(LogLevel::Warn, "bus " + d.name + ": parent " + d.parent + " makes a loop - using master");
+                    parent = 0;
+                    break;
+                }
+            if (parent != b.parent) {
+                b.parent = parent;
+                ma_node_attach_output_bus(&b.meter, 0, &buses[parent]->group, 0);
+            }
+        }
     }
 
     void cull(const std::string& event, const char* reason) {
@@ -618,6 +644,10 @@ void Mixer::setEvents(std::vector<EventDef> events) {
     if (m->ready) m->setEvents(std::move(events));
 }
 
+void Mixer::setBuses(const std::vector<BusDef>& buses) {
+    if (m->ready) m->setBuses(buses);
+}
+
 Handle Mixer::play(std::string_view event, Vec3 position, std::initializer_list<Param> params) {
     return m->request(event, true, position, params);
 }
@@ -680,7 +710,7 @@ void Mixer::setBusVolume(std::string_view name, float volume) {
     if (!m->ready) return;
     Bus& b = *m->buses[m->bus(name)];
     b.volume = std::max(volume, 0.0f);
-    ma_sound_group_set_volume(&b.group, b.volume);
+    m->applyBusVolume(b);
 }
 
 float Mixer::busVolume(std::string_view name) const {
@@ -742,7 +772,10 @@ const std::deque<CullInfo>& Mixer::culls() const { return m->culls; }
 
 void Mixer::buses(std::vector<BusInfo>& out) const {
     out.clear();
-    for (const auto& b : m->buses) out.push_back({b->name, b->volume, b->meter.peak.load(std::memory_order_relaxed)});
+    for (size_t i = 0; i < m->buses.size(); ++i) {
+        const Bus& b = *m->buses[i];
+        out.push_back({b.name, b.volume, b.meter.peak.load(std::memory_order_relaxed), b.mix, i ? m->buses[b.parent]->name : std::string()});
+    }
 }
 
 const Stats& Mixer::stats() const { return m->stats; }

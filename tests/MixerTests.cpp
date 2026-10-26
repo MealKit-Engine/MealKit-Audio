@@ -1,4 +1,5 @@
 // mkaudio 시험: 장치 없이(Desc::noDevice) 섞고 render()로 꺼내 본다. 클립은 시험이 만든 WAV 파일.
+#include "mkaudio/Events.h"
 #include "mkaudio/Mixer.h"
 
 #include <cmath>
@@ -72,9 +73,42 @@ mkaudio::EventDef event(const char* name, const std::string& file) {
     return e;
 }
 
+// 이벤트 파일: 읽기·쓰기 왕복, 기본값은 쓰지 않는다, 틀린 줄은 메시지
+void testEventFile() {
+    const char* text = "# comment\n@format audio-events 1\n\nmixbus music\nvolume 0.5\n\nmixbus ambience\nparent music\n\n"
+                       "event hit\nclips a.wav  b.wav\ncontainer blend\nparam speed\nparamMax 15\nvolumeRandom 0.15\nspatial false\nbus ambience\n"
+                       "steal quietest\nmaxInstances 3\nsubtitle sub.hit\nfuture 1\n\nevent hit\nvolume 2\n\nevent bad name\n\nevent quiet\nvolume x\n";
+    mkaudio::EventFile f;
+    std::vector<mkaudio::ParseMessage> messages;
+    CHECK(mkaudio::parseEvents(text, f, &messages));
+    CHECK(f.buses.size() == 2 && f.buses[0].name == "music" && f.buses[0].volume == 0.5f && f.buses[1].parent == "music");
+    CHECK(f.events.size() == 2 && f.events[0].name == "hit" && f.events[1].name == "quiet");
+    const mkaudio::EventDef& hit = f.events[0];
+    CHECK(hit.clips.size() == 2 && hit.clips[1].name == "b.wav" && hit.clips[1].file.empty());
+    CHECK(hit.container == mkaudio::Container::Blend && hit.param == "speed" && hit.paramMax == 15.0f && !hit.spatial);
+    CHECK(hit.steal == mkaudio::Steal::Quietest && hit.maxInstances == 3 && hit.subtitle == "sub.hit" && hit.bus == "ambience");
+    size_t errors = 0, warnings = 0;
+    for (const auto& m : messages) (m.error ? errors : warnings)++;
+    CHECK(errors == 3 && warnings == 1); // 겹친 이름, 틀린 이름, 틀린 값 / 모르는 키
+
+    const std::string written = mkaudio::writeEvents(f);
+    CHECK(written.find("\n@format audio-events 1\n") != std::string::npos);
+    CHECK(written.find("pitch ") == std::string::npos); // 기본값은 쓰지 않는다
+    CHECK(written.find("volumeRandom 0.15\n") != std::string::npos && written.find("spatial false\n") != std::string::npos);
+    mkaudio::EventFile back;
+    CHECK(mkaudio::parseEvents(written, back) && mkaudio::writeEvents(back) == written);
+
+    CHECK(!mkaudio::parseEvents("@format table 1\nrow x\n", back)); // 다른 종류의 파일
+    CHECK(mkaudio::saveEventFile("mkaudio_test.events", f) && mkaudio::loadEventFile("mkaudio_test.events", back) && back.events.size() == 2);
+    std::remove("mkaudio_test.events");
+    mkaudio::resolveClips(back, [](const std::string& name) { return name == "a.wav" ? std::string("/x/a.wav") : std::string(); });
+    CHECK(back.events[0].clips[0].file == "/x/a.wav" && back.events[0].clips[1].file.empty());
+}
+
 } // namespace
 
 int main() {
+    testEventFile();
     const std::string beepFile = "mkaudio_test_beep.wav", humFile = "mkaudio_test_hum.wav";
     CHECK(writeWav(beepFile, 0.3, 440.0));
     CHECK(writeWav(humFile, 0.5, 220.0));
@@ -172,6 +206,16 @@ int main() {
     mixer.play2D("beep");
     frame(mixer); // 볼륨 변화가 다음 덩어리부터
     CHECK(frame(mixer) < 0.001f);
+    // 버스 정의: 부모·믹스 볼륨, 돌고 도는 부모는 master로
+    mixer.setBuses({{"ambience", "music", 0.5f}, {"music", "ambience", 1.0f}});
+    mixer.buses(buses);
+    const auto busNamed = [&](const char* name) {
+        for (const mkaudio::BusInfo& b : buses)
+            if (b.name == name) return b;
+        return mkaudio::BusInfo{};
+    };
+    CHECK(busNamed("ambience").parent == "music" && busNamed("ambience").mix == 0.5f);
+    CHECK(busNamed("music").parent == "master"); // music → ambience → music 고리
 
     // 정의를 바꾸면 재생 중인 소리는 이름으로 잇고, 없어진 이벤트는 멈춘다
     mixer.setBusVolume("sfx", 1.0f);

@@ -1,0 +1,7 @@
+# MealKit tool manifest (MealKit tool contract: the editor's Tools menu reads this file next to the program)
+@format tool 1
+name MealKit Audio
+exe MealKitAudio
+version @MKAUDIO_VERSION@
+protocol 1
+opens .events .wav .ogg
