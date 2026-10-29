@@ -12,8 +12,8 @@ endif()
 if(NOT MKAUDIO_STB_DIR)
     set(MKAUDIO_STB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb)
 endif()
-option(MKAUDIO_BUILD_TESTS "mkaudio 시험 빌드" ${PROJECT_IS_TOP_LEVEL})
-option(MKAUDIO_BUILD_TOOL "저작 도구 MealKitAudio 빌드 (SDL3 + Dear ImGui)" ${PROJECT_IS_TOP_LEVEL})
+option(MKAUDIO_BUILD_TESTS "Build mkaudio tests" ${PROJECT_IS_TOP_LEVEL})
+option(MKAUDIO_BUILD_TOOL "Build the MealKitAudio authoring tool (SDL3 + Dear ImGui)" ${PROJECT_IS_TOP_LEVEL})
 
 add_library(mkaudio STATIC
     include/mkaudio/Mixer.h
