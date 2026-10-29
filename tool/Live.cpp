@@ -112,7 +112,7 @@ HttpResult request(const Instance& to, const char* method, const std::string& pa
     char buffer[16384];
     for (;;) {
         const int n = recv(s, buffer, sizeof(buffer), 0);
-        if (n <= 0) break; // 끝(서버가 닫는다) 또는 시간 초과
+        if (n <= 0) break; // end (the server closes) or timeout
         response.append(buffer, static_cast<size_t>(n));
     }
     closeSocket(s);

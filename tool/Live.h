@@ -6,8 +6,8 @@
 #include <string>
 #include <vector>
 
-// 라이브 연결 클라이언트 (MealKit 도구 사이 약속: 프로젝트 build/live/<종류>-<pid>.json → http://127.0.0.1:<port>/<토큰>/...).
-// 이 컴퓨터 안의 짧은 요청이라 메인 스레드에서 짧은 시간 제한으로 막고 기다린다.
+// Live connection client (MealKit tool contract: project build/live/<kind>-<pid>.json → http://127.0.0.1:<port>/<token>/...).
+// Short requests within this computer, so it blocks on the main thread with a short timeout.
 namespace mkaudio::tool {
 
 struct Instance {
@@ -19,19 +19,19 @@ struct Instance {
 };
 
 struct HttpResult {
-    int status = 0; // 0 = 연결하지 못했다
+    int status = 0; // 0 = couldn't connect
     std::string body;
 };
 
-inline constexpr uint32_t kLiveProtocol = 1; // 엔진 live::kProtocol, mealkit-tool.txt의 protocol
+inline constexpr uint32_t kLiveProtocol = 1; // engine live::kProtocol, protocol in mealkit-tool.txt
 
-// 프로젝트의 접속 정보 파일들 (파일이 남아 있어도 프로세스가 없을 수 있다: 요청이 실패하면 없는 것으로 본다)
+// The project's connection info files (the process may be gone even if the file remains: a failed request means it's gone)
 std::vector<Instance> findInstances(const std::string& projectDir);
 
-// path는 토큰 뒤 경로 ("audio/state"). body는 POST 본문
+// path is the path after the token ("audio/state"). body is the POST body
 HttpResult request(const Instance& to, const char* method, const std::string& path, const std::string& body = {}, int timeoutMs = 300);
 
-// 폼 본문용 (a=b&c=d): 글자·숫자·-_.~ 밖은 %XX
+// For form bodies (a=b&c=d): anything other than letters/digits/-_.~ becomes %XX
 std::string urlEncode(const std::string& text);
 
 } // namespace mkaudio::tool

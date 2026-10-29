@@ -12,26 +12,26 @@
 #include <string>
 #include <vector>
 
-// MealKit Audio: 사운드 디자이너용 저작 도구. 프로젝트의 assets/sounds.events를 고치고(게임이 그대로 읽는다),
-// 런타임(mkaudio::Mixer)으로 미리 듣고, 라이브 연결로 실행 중인 게임·에디터에서 재생하고 상태를 본다.
+// MealKit Audio: authoring tool for sound designers. Edits the project's assets/sounds.events (read by the game as is),
+// previews with the runtime (mkaudio::Mixer), and plays in a running game/editor and watches state over the live connection.
 namespace mkaudio::tool {
 
 class App {
 public:
-    bool init(const std::string& projectDir); // 비면 프로젝트 고르기 화면
+    bool init(const std::string& projectDir); // project picker screen if empty
     void shutdown();
-    // 매 프레임 (ImGui NewFrame과 Render 사이). 창을 닫으려 하면 requestQuit(), 고친 것이 없거나 사용자가 정하면 canQuit()
+    // Every frame (between ImGui NewFrame and Render). When the window is about to close, requestQuit(); canQuit() if nothing is edited or the user decides
     void frame(double dt);
     void requestQuit() { m_quitAsked = true; }
     bool canQuit() const { return m_quitConfirmed; }
     std::string title() const;
-    // 다른 스레드(폴더 고르기 대화상자)가 넘긴 프로젝트
+    // Project passed from another thread (folder picker dialog)
     void setPendingProject(const std::string& dir);
-    void select(const std::string& event); // 이 이름의 이벤트를 고른다 (명령줄 --select)
-    void* window = nullptr; // SDL_Window* (대화상자 부모)
+    void select(const std::string& event); // selects the event with this name (command line --select)
+    void* window = nullptr; // SDL_Window* (dialog parent)
 
 private:
-    // 프로젝트·파일
+    // Project/file
     bool openProject(const std::string& dir);
     std::string assetsDir() const;
     std::string eventsPath() const;
@@ -42,10 +42,10 @@ private:
     void importTable();
     void checkExternalChange();
     void applyToMixer();
-    void snapshot(); // 되돌리기 기록
+    void snapshot(); // undo record
     void undo(bool redo);
 
-    // 화면
+    // Screen
     void drawMenu();
     void drawStart();
     void drawEventList();
@@ -56,20 +56,20 @@ private:
     void drawQuitDialog();
     void layoutDocks(unsigned dockspace);
 
-    // 라이브 연결
+    // Live connection
     void refreshLive(bool force);
     void playInGame(const EventDef& e);
     void reloadInGames();
 
     std::string m_project; // UTF-8
     EventFile m_file;
-    std::string m_savedText;    // 마지막으로 읽거나 쓴 내용 (고쳤는지 = 지금 글자가 다르다)
-    std::string m_appliedText;  // 미리 듣기 믹서에 넣은 내용
+    std::string m_savedText;    // contents last read or written (edited = the current text differs)
+    std::string m_appliedText;  // contents put into the preview mixer
     std::filesystem::file_time_type m_fileTime{};
     double m_fileCheck = 0.0;
     bool m_externalChange = false;
     std::vector<ParseMessage> m_messages;
-    std::vector<std::string> m_clipFiles; // assets 기준 경로 (.wav .ogg)
+    std::vector<std::string> m_clipFiles; // paths relative to assets (.wav .ogg)
     std::string m_status;
     double m_statusTime = 0.0;
 
@@ -77,7 +77,7 @@ private:
     std::string m_lastSnapshot;
 
     int m_selected = -1;
-    int m_previewFor = -1; // 미리 듣기 파라미터를 맞춘 이벤트 (고른 것이 바뀌면 범위 시작으로)
+    int m_previewFor = -1; // event the preview parameters were set for (reset to the range start when the selection changes)
     char m_filter[64] = {};
     char m_rename[64] = {};
     int m_renaming = -1;
@@ -90,7 +90,7 @@ private:
 
     std::vector<Instance> m_live;
     std::vector<bool> m_liveOn;
-    std::string m_liveState; // 고른 게임의 audio/state (JSON)
+    std::string m_liveState; // audio/state of the selected game (JSON)
     Json m_liveJson;
     double m_liveCheck = 0.0, m_stateCheck = 0.0;
     std::string m_liveError;

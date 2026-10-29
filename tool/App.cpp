@@ -13,10 +13,10 @@
 namespace mkaudio::tool {
 namespace {
 
-constexpr const char* kEventsFile = "sounds.events"; // assets 기준
-constexpr const char* kOldTable = "sounds.table";    // MealKit 엔진 0.5의 형식 (불러와 옮긴다)
+constexpr const char* kEventsFile = "sounds.events"; // relative to assets
+constexpr const char* kOldTable = "sounds.table";    // MealKit engine 0.5 format (loaded and migrated)
 constexpr size_t kUndoDepth = 200;
-const char* const kStandardBuses[] = {"master", "music", "sfx", "ui", "voice"}; // 런타임이 처음부터 만드는 버스
+const char* const kStandardBuses[] = {"master", "music", "sfx", "ui", "voice"}; // buses the runtime creates from the start
 
 std::filesystem::path pathOf(const std::string& utf8) { return std::filesystem::path(std::u8string(utf8.begin(), utf8.end())); }
 
@@ -34,7 +34,7 @@ bool readFile(const std::filesystem::path& p, std::string& out) {
     return true;
 }
 
-// 곡선 하나: 파라미터 min(왼쪽)~max(오른쪽)에서 값 atMin~atMax 직선. 끝점을 위아래로 끌어 바꾼다. t = 미리 듣기 위치(0..1)
+// One curve: a straight line from value atMin to atMax over parameter min (left) to max (right). Drag the endpoints up/down to change it. t = preview position (0..1)
 bool curveEditor(const char* id, float& atMin, float& atMax, float lo, float hi, float t, const char* format) {
     bool changed = false;
     const ImVec2 size(ImGui::GetContentRegionAvail().x, 70.0f * ImGui::GetStyle().FontScaleDpi);
@@ -69,7 +69,7 @@ bool curveEditor(const char* id, float& atMin, float& atMax, float lo, float hi,
     return changed;
 }
 
-// 거리 감쇠 그림: min까지 1, max에서 0 (런타임과 같은 직선 모델). d = 미리 듣기 거리
+// Distance attenuation graph: 1 up to min, 0 at max (same linear model as the runtime). d = preview distance
 void attenuationPlot(float minDistance, float maxDistance, float d) {
     const ImVec2 size(ImGui::GetContentRegionAvail().x, 60.0f * ImGui::GetStyle().FontScaleDpi);
     const ImVec2 p0 = ImGui::GetCursorScreenPos(), p1(p0.x + size.x, p0.y + size.y);
@@ -96,7 +96,7 @@ bool knownBus(const EventFile& f, const std::string& name) {
 
 } // namespace
 
-// ---------------------------------------------------------------- 시작·끝
+// ---------------------------------------------------------------- Start/end
 
 bool App::init(const std::string& projectDir) {
     Desc d;
@@ -208,11 +208,11 @@ bool App::save() {
     m_externalChange = false;
     m_status = "Saved assets/sounds.events";
     m_statusTime = m_time;
-    reloadInGames(); // 실행 중인 게임·에디터는 파일 시각으로도 다시 읽지만, 바로 듣게 알린다
+    reloadInGames(); // running games/editors also reread by file time, but are notified so changes are heard right away
     return true;
 }
 
-// MealKit 0.5의 assets/sounds.table ("row <이름>" + 같은 키) → 이벤트
+// MealKit 0.5's assets/sounds.table ("row <name>" + the same keys) → events
 void App::importTable() {
     std::string text;
     if (!readFile(pathOf(m_project) / "assets" / kOldTable, text)) return;
@@ -240,7 +240,7 @@ void App::checkExternalChange() {
     std::error_code ec;
     const auto t = std::filesystem::last_write_time(pathOf(eventsPath()), ec);
     if (ec || t == m_fileTime) return;
-    if (writeEvents(m_file) == m_savedText) load(); // 고친 것이 없으면 그냥 다시 읽는다
+    if (writeEvents(m_file) == m_savedText) load(); // if nothing was edited, just reread
     else m_externalChange = true;
 }
 
@@ -255,7 +255,7 @@ void App::applyToMixer() {
 }
 
 void App::snapshot() {
-    if (ImGui::IsAnyItemActive()) return; // 끄는 중에는 한 번만 (놓을 때)
+    if (ImGui::IsAnyItemActive()) return; // only once while dragging (on release)
     const std::string text = writeEvents(m_file);
     if (text == m_lastSnapshot) return;
     m_undo.push_back(m_lastSnapshot);
@@ -275,7 +275,7 @@ void App::undo(bool redo) {
     if (m_selected >= static_cast<int>(m_file.events.size())) m_selected = static_cast<int>(m_file.events.size()) - 1;
 }
 
-// ---------------------------------------------------------------- 매 프레임
+// ---------------------------------------------------------------- Every frame
 
 void App::frame(double dt) {
     m_time += dt;
@@ -317,7 +317,7 @@ void App::frame(double dt) {
 
 void App::layoutDocks(unsigned dockspace) {
     m_layoutDone = true;
-    if (ImGui::DockBuilderGetNode(dockspace) && ImGui::DockBuilderGetNode(dockspace)->IsSplitNode()) return; // imgui.ini에 배치가 있다
+    if (ImGui::DockBuilderGetNode(dockspace) && ImGui::DockBuilderGetNode(dockspace)->IsSplitNode()) return; // imgui.ini has a layout
     ImGui::DockBuilderRemoveNode(dockspace);
     ImGui::DockBuilderAddNode(dockspace, ImGuiDockNodeFlags_DockSpace);
     ImGui::DockBuilderSetNodeSize(dockspace, ImGui::GetMainViewport()->WorkSize);
@@ -384,7 +384,7 @@ void App::drawStart() {
     ImGui::End();
 }
 
-// ---------------------------------------------------------------- 이벤트 목록
+// ---------------------------------------------------------------- Event list
 
 void App::drawEventList() {
     ImGui::Begin("Events");
@@ -438,7 +438,7 @@ void App::drawEventList() {
     ImGui::End();
 }
 
-// ---------------------------------------------------------------- 이벤트 편집
+// ---------------------------------------------------------------- Event editing
 
 void App::drawEventEditor() {
     ImGui::Begin("Event");
@@ -453,7 +453,7 @@ void App::drawEventEditor() {
     }
     EventDef& e = m_file.events[static_cast<size_t>(m_selected)];
 
-    // 이름 (game code: ctx.audio.play("name", ...))
+    // Name (game code: ctx.audio.play("name", ...))
     if (m_renaming != m_selected) {
         std::snprintf(m_rename, sizeof(m_rename), "%s", e.name.c_str());
         m_renaming = m_selected;
@@ -472,7 +472,7 @@ void App::drawEventEditor() {
     ImGui::SameLine();
     ImGui::TextDisabled("game code: play(\"%s\")", e.name.c_str());
 
-    // ---- 클립
+    // ---- Clips
     ImGui::SeparatorText("Clips");
     int container = static_cast<int>(e.container);
     ImGui::SetNextItemWidth(160);
@@ -509,7 +509,7 @@ void App::drawEventEditor() {
         ImGui::EndCombo();
     }
 
-    // ---- 소리 크기·높이
+    // ---- Volume/pitch
     ImGui::SeparatorText("Volume and pitch");
     ImGui::SetNextItemWidth(200);
     ImGui::SliderFloat("Volume", &e.volume, 0.0f, 2.0f, "%.2f");
@@ -522,7 +522,7 @@ void App::drawEventEditor() {
     ImGui::SetNextItemWidth(140);
     ImGui::SliderFloat("+/- random##p", &e.pitchRandom, 0.0f, 0.5f, "%.2f");
 
-    // ---- 파라미터와 곡선
+    // ---- Parameters and curves
     ImGui::SeparatorText("Parameter");
     char param[64];
     std::snprintf(param, sizeof(param), "%s", e.param.c_str());
@@ -553,7 +553,7 @@ void App::drawEventEditor() {
         attenuationPlot(e.minDistance, e.maxDistance, m_distance);
     }
 
-    // ---- 재생
+    // ---- Playback
     ImGui::SeparatorText("Playback");
     ImGui::SetNextItemWidth(160);
     if (ImGui::BeginCombo("Bus", e.bus.c_str())) {
@@ -582,7 +582,7 @@ void App::drawEventEditor() {
     ImGui::SetNextItemWidth(160);
     ImGui::DragFloat("Cooldown", &e.cooldown, 0.01f, 0.0f, 60.0f, "%.2f s");
 
-    // ---- 자막
+    // ---- Subtitles
     ImGui::SeparatorText("Subtitle");
     char subtitle[96];
     std::snprintf(subtitle, sizeof(subtitle), "%s", e.subtitle.c_str());
@@ -601,7 +601,7 @@ void App::drawEventEditor() {
     ImGui::End();
 }
 
-// ---------------------------------------------------------------- 버스
+// ---------------------------------------------------------------- Buses
 
 void App::drawBuses() {
     ImGui::Begin("Buses");
@@ -687,7 +687,7 @@ void App::drawBuses() {
     ImGui::End();
 }
 
-// ---------------------------------------------------------------- 미리 듣기
+// ---------------------------------------------------------------- Preview
 
 void App::drawPreview() {
     ImGui::Begin("Preview");
@@ -730,7 +730,7 @@ void App::drawPreview() {
     ImGui::End();
 }
 
-// ---------------------------------------------------------------- 라이브 연결
+// ---------------------------------------------------------------- Live connection
 
 void App::refreshLive(bool force) {
     if (m_project.empty()) return;
@@ -755,7 +755,7 @@ void App::refreshLive(bool force) {
             m_liveJson = {};
             if (!Json::parse(m_liveState, m_liveJson)) m_liveState.clear();
         }
-        break; // 상태는 처음 고른 하나만 본다
+        break; // state is watched only for the first selected one
     }
 }
 
@@ -797,7 +797,7 @@ void App::drawLive() {
     const bool dirty = writeEvents(m_file) != m_savedText;
     ImGui::BeginDisabled(!e);
     if (ImGui::Button("Play in game") && e) {
-        if (dirty) save(); // 게임은 저장된 파일을 듣는다
+        if (dirty) save(); // the game hears the saved file
         playInGame(*e);
     }
     ImGui::EndDisabled();

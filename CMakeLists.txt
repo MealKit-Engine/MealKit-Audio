@@ -1,8 +1,8 @@
-# mkaudio: 소리 이벤트 런타임 (MealKit Audio). 혼자 빌드하면 시험과 저작 도구(tool/)까지, 다른 프로젝트가 add_subdirectory로 넣으면 라이브러리만.
+# mkaudio: sound event runtime (MealKit Audio). Built standalone it includes tests and the authoring tool (tool/); added by another project with add_subdirectory, only the library.
 #   cmake -S . -B build && cmake --build build && ctest --test-dir build
-# 넣는 쪽이 정할 수 있는 값 (없으면 이 저장소의 third_party/):
-#   MKAUDIO_MINIAUDIO_DIR   miniaudio.h가 있는 폴더
-#   MKAUDIO_STB_DIR         stb_vorbis.c가 있는 폴더
+# Values the including side can set (defaults to this repo's third_party/):
+#   MKAUDIO_MINIAUDIO_DIR   folder containing miniaudio.h
+#   MKAUDIO_STB_DIR         folder containing stb_vorbis.c
 cmake_minimum_required(VERSION 3.25)
 project(mkaudio VERSION 0.2.0 LANGUAGES C CXX)
 
@@ -29,7 +29,7 @@ target_compile_definitions(mkaudio PUBLIC MKAUDIO_VERSION="${PROJECT_VERSION}")
 if(MSVC)
     target_compile_options(mkaudio PRIVATE /permissive- /utf-8 /Zc:__cplusplus)
     set_source_files_properties(src/Mixer.cpp src/Events.cpp PROPERTIES COMPILE_OPTIONS "/W4")
-    set_source_files_properties(src/MiniaudioImpl.cpp PROPERTIES COMPILE_OPTIONS "/W0") # 외부 라이브러리 구현
+    set_source_files_properties(src/MiniaudioImpl.cpp PROPERTIES COMPILE_OPTIONS "/W0") # external library implementation
 else()
     target_compile_options(mkaudio PRIVATE -Wall -Wextra)
     set_source_files_properties(src/MiniaudioImpl.cpp PROPERTIES COMPILE_OPTIONS "-w")

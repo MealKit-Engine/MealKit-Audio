@@ -1,8 +1,8 @@
 #pragma once
 
-// miniaudio 설정 (mkaudio 안에서만 include한다. 이름이 miniaudio.h와 겹치지 않게). 구현은 MiniaudioImpl.cpp 하나.
-// 디코더: WAV(효과음, 메모리에 풀어 둔다)와 Ogg Vorbis(배경음 스트리밍, stb_vorbis). MP3·FLAC·인코딩·생성기는 뺀다.
-// 장치 백엔드는 플랫폼마다 하나 (Windows WASAPI). 다른 플랫폼은 5단계에서 그 플랫폼 백엔드를 켠다.
+// miniaudio configuration (included only inside mkaudio. Named so it doesn't collide with miniaudio.h). The implementation is the single MiniaudioImpl.cpp.
+// Decoders: WAV (sound effects, decoded into memory) and Ogg Vorbis (music streaming, stb_vorbis). MP3/FLAC/encoding/generators are excluded.
+// One device backend per platform (Windows WASAPI). Other platforms enable their backend in stage 5.
 #define MA_NO_FLAC
 #define MA_NO_MP3
 #define MA_NO_ENCODING

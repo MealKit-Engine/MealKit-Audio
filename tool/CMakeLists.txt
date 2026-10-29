@@ -1,8 +1,8 @@
-# MealKit Audio 저작 도구 (MealKitAudio): SDL3 창 + Dear ImGui(도킹) + 런타임 mkaudio. 빌드 결과는 <빌드 폴더>/bin/에
-# 실행 파일과 매니페스트 mealkit-tool.txt가 같이 놓인다 → 그 폴더를 %LOCALAPPDATA%\MealKit\tools\audio\에 넣거나,
-# MealKit 에디터를 --tool-path <빌드 폴더>/bin로 열면 [도구] 메뉴에 나온다. cmake --install로도 같은 폴더 모양을 만든다.
+# MealKit Audio authoring tool (MealKitAudio): SDL3 window + Dear ImGui (docking) + the mkaudio runtime. Build output goes to <build folder>/bin/
+# with the executable and the manifest mealkit-tool.txt together → put that folder in %LOCALAPPDATA%\MealKit\tools\audio\, or
+# open the MealKit editor with --tool-path <build folder>/bin and it appears in the [Tools] menu. cmake --install makes the same folder shape.
 
-# SDL3 (정적, 시험·예제 없이)
+# SDL3 (static, without tests/examples)
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
@@ -34,7 +34,7 @@ foreach(config Debug Release RelWithDebInfo MinSizeRel)
     set_target_properties(MealKitAudio PROPERTIES RUNTIME_OUTPUT_DIRECTORY_${upper} ${CMAKE_BINARY_DIR}/bin)
 endforeach()
 
-# 매니페스트 (버전은 project(mkaudio VERSION ...)). exe는 확장자 없이 적고 Windows에서는 .exe를 붙인다
+# Manifest (version from project(mkaudio VERSION ...)). exe is written without an extension, .exe is appended on Windows
 set(MKAUDIO_VERSION ${PROJECT_VERSION})
 configure_file(mealkit-tool.txt ${CMAKE_BINARY_DIR}/bin/mealkit-tool.txt @ONLY)
 if(WIN32)

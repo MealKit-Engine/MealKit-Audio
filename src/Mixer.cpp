@@ -11,14 +11,14 @@
 namespace mkaudio {
 namespace {
 
-constexpr uint32_t kVoiceSlots = 256;    // 실제 + 가상 + 시작 대기
-constexpr uint32_t kMaxLayers = 4;       // 블렌드 컨테이너가 같이 내는 클립 수
-constexpr size_t kCullHistory = 64;      // 끊긴 소리 기록
-constexpr float kInaudible = 0.002f;     // 이보다 작으면 들리지 않는 것으로 본다 (가상 목소리)
+constexpr uint32_t kVoiceSlots = 256;    // real + virtual + waiting to start
+constexpr uint32_t kMaxLayers = 4;       // number of clips a blend container plays together
+constexpr size_t kCullHistory = 64;      // record of culled sounds
+constexpr float kInaudible = 0.002f;     // below this counts as inaudible (virtual voice)
 
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-// 화면용 무작위 (PCG32, 결정론과 무관)
+// Cosmetic randomness (PCG32, unrelated to determinism)
 struct Random {
     uint64_t state = 0x853c49e6748fea9bull;
     explicit Random(uint64_t seed = 1) { reseed(seed); }
@@ -39,7 +39,7 @@ struct Random {
     float range(float a, float b) { return a + (b - a) * (static_cast<float>(next() >> 8) / 16777216.0f); }
 };
 
-// 버스 출력의 최댓값을 재는 노드 (오디오 스레드가 적고 메인 스레드가 읽는다)
+// Node that measures the peak of bus output (written by the audio thread, read by the main thread)
 struct MeterNode {
     ma_node_base base;
     std::atomic<float> peak{0.0f};
@@ -48,12 +48,12 @@ struct MeterNode {
 void meterProcess(ma_node* node, const float** framesIn, ma_uint32* frameCountIn, float** framesOut, ma_uint32* frameCountOut) {
     MeterNode* meter = reinterpret_cast<MeterNode*>(node);
     const ma_uint32 channels = ma_node_get_output_channels(node, 0);
-    if (!framesIn || !framesIn[0]) { // 아무것도 연결되지 않았다
+    if (!framesIn || !framesIn[0]) { // nothing is connected
         std::fill(framesOut[0], framesOut[0] + *frameCountOut * channels, 0.0f);
         return;
     }
     const ma_uint32 frames = std::min(*frameCountIn, *frameCountOut);
-    float peak = meter->peak.load(std::memory_order_relaxed) * 0.97f; // 천천히 떨어진다
+    float peak = meter->peak.load(std::memory_order_relaxed) * 0.97f; // decays slowly
     const ma_uint32 samples = frames * channels;
     for (ma_uint32 i = 0; i < samples; ++i) {
         const float s = framesIn[0][i];
@@ -71,20 +71,20 @@ struct Bus {
     std::string name;
     ma_sound_group group;
     MeterNode meter;
-    float volume = 1.0f; // 플레이어 볼륨
-    float mix = 1.0f;    // 믹스 볼륨 (BusDef)
-    uint32_t parent = 0; // master(0)는 자기 자신
+    float volume = 1.0f; // player volume
+    float mix = 1.0f;    // mix volume (BusDef)
+    uint32_t parent = 0; // master (0) is its own parent
 };
 
 struct Clip {
     std::string file;
     bool decoded = false;
-    ma_sound source; // 미리 풀어 둔 원본 (복사해서 재생한다, decoded일 때만)
+    ma_sound source; // pre-decoded source (copied to play, only when decoded)
 };
 
 struct EventInfo {
     EventDef def;
-    std::vector<uint32_t> clips; // m->clips 번호 (없는 클립은 kMissing)
+    std::vector<uint32_t> clips; // m->clips indices (kMissing for missing clips)
     uint32_t bus = 0;
     double lastPlay = -1e9;
     uint32_t lastClip = 0xFFFFFFFFu;
@@ -97,26 +97,26 @@ struct Layer {
     ma_lpf_node lpf;
     bool sound_ = false;
     bool lpf_ = false;
-    float cutoff = 0.0f; // 지금 걸린 로우패스 (같으면 다시 만들지 않는다)
+    float cutoff = 0.0f; // the lowpass currently applied (not rebuilt if the same)
 };
 
 struct Voice {
     uint32_t generation = 1;
     bool used = false;
-    bool pending = true; // play() 다음 update()를 기다림
-    bool real = false;   // 섞는 중
+    bool pending = true; // waiting for the update() after play()
+    bool real = false;   // being mixed
     std::string eventName;
     uint32_t event = 0;
     bool spatial = false;
     Vec3 position;
     std::vector<std::pair<std::string, float>> params;
-    float strength = 0.0f; // 같은 프레임 묶기의 세기 (곡선 파라미터, 없으면 볼륨)
+    float strength = 0.0f; // strength for same-frame grouping (curve parameter, volume if none)
     float volumeScale = 1.0f, pitchScale = 1.0f;
-    uint32_t clip = 0; // 무작위·스위치가 고른 클립 (블렌드는 전부)
+    uint32_t clip = 0; // clip chosen by random/switch (all for blend)
     Layer layers[kMaxLayers];
     uint32_t layerCount = 0;
     double startTime = 0.0;
-    double virtualCursor = 0.0; // 가상 목소리가 센 재생 위치 (초)
+    double virtualCursor = 0.0; // playback position counted by a virtual voice (seconds)
     double fadeStart = 0.0, fadeEnd = 0.0;
     bool fading = false;
     float audibility = 0.0f;
@@ -153,13 +153,13 @@ struct Mixer::Impl {
         if (desc.log) desc.log(level, text);
     }
 
-    // ---------------------------------------------------------------- 버스
+    // ---------------------------------------------------------------- Buses
     uint32_t bus(std::string_view name) {
         for (uint32_t i = 0; i < buses.size(); ++i)
             if (buses[i]->name == name) return i;
         auto b = std::make_unique<Bus>();
         b->name = std::string(name);
-        // 버스 → 미터 → (master 버스 → master 미터) → 장치
+        // bus → meter → (master bus → master meter) → device
         ma_sound_group* parent = buses.empty() ? nullptr : &buses[0]->group;
         if (ma_sound_group_init(&engine, 0, parent, &b->group) != MA_SUCCESS) {
             log(LogLevel::Warn, "cannot create bus " + b->name);
@@ -188,9 +188,9 @@ struct Mixer::Impl {
             Bus& b = *buses[index];
             b.mix = std::max(d.volume, 0.0f);
             applyBusVolume(b);
-            if (index == 0) continue; // master는 맨 위
+            if (index == 0) continue; // master is at the top
             uint32_t parent = bus(d.parent.empty() ? "master" : d.parent);
-            for (uint32_t p = parent; p != 0; p = buses[p]->parent) // 부모를 따라가다 자기가 나오면 돌고 돈다
+            for (uint32_t p = parent; p != 0; p = buses[p]->parent) // following parents and reaching itself means a cycle
                 if (p == index) {
                     log(LogLevel::Warn, "bus " + d.name + ": parent " + d.parent + " makes a loop - using master");
                     parent = 0;
@@ -209,7 +209,7 @@ struct Mixer::Impl {
         ++stats.culledThisFrame;
     }
 
-    // ---------------------------------------------------------------- 이벤트·클립
+    // ---------------------------------------------------------------- Events/clips
     uint32_t clip(const std::string& file, bool stream) {
         if (file.empty()) return kMissing;
         for (uint32_t i = 0; i < clips.size(); ++i)
@@ -224,7 +224,7 @@ struct Mixer::Impl {
         return static_cast<uint32_t>(clips.size() - 1);
     }
 
-    // 효과음은 정의를 받을 때 메모리에 풀어 둔다 (재생 때 디스크를 읽지 않는다)
+    // Sound effects are decoded into memory when definitions are received (no disk reads at playback)
     void decode(Clip& c) {
         if (c.decoded) return;
         if (ma_sound_init_from_file(&engine, c.file.c_str(), MA_SOUND_FLAG_DECODE | MA_SOUND_FLAG_NO_SPATIALIZATION, nullptr, nullptr,
@@ -242,7 +242,7 @@ struct Mixer::Impl {
             e.def = std::move(d);
             for (const ClipRef& c : e.def.clips) e.clips.push_back(clip(c.file, e.def.stream));
             e.bus = bus(e.def.bus.empty() ? "sfx" : e.def.bus);
-            for (const EventInfo& old : events) // 쿨다운·직전 클립은 다시 읽어도 이어 간다
+            for (const EventInfo& old : events) // cooldowns/last clips carry over even after a reload
                 if (old.def.name == e.def.name) {
                     e.lastPlay = old.lastPlay;
                     e.lastClip = old.lastClip;
@@ -250,7 +250,7 @@ struct Mixer::Impl {
             next.push_back(std::move(e));
         }
         events = std::move(next);
-        // 재생 중인 소리는 이름으로 새 정의를 찾는다 (없어진 이벤트는 멈춘다)
+        // Playing sounds find their new definitions by name (vanished events stop)
         for (uint32_t i = 0; i < kVoiceSlots; ++i) {
             Voice& v = voices[i];
             if (!v.used) continue;
@@ -266,7 +266,7 @@ struct Mixer::Impl {
         return nullptr;
     }
 
-    // ---------------------------------------------------------------- 목소리
+    // ---------------------------------------------------------------- Voices
     float param(const Voice& v, const std::string& name, float fallback) const {
         for (const auto& [n, value] : v.params)
             if (n == name) return value;
@@ -275,7 +275,7 @@ struct Mixer::Impl {
         return fallback;
     }
 
-    // 곡선 파라미터의 0..1 위치
+    // 0..1 position of a curve parameter
     float curveT(const Voice& v, const EventDef& d) const {
         if (d.param.empty()) return 0.0f;
         const float p = param(v, d.param, d.paramMin);
@@ -303,7 +303,7 @@ struct Mixer::Impl {
     bool realize(Voice& v, double cursor) {
         const EventInfo& e = events[v.event];
         const EventDef& d = e.def;
-        // 블렌드는 모든 클립을 같이, 나머지는 고른 클립 하나
+        // Blend plays all clips together, others the one chosen clip
         std::vector<uint32_t> chosen;
         if (d.container == Container::Blend)
             for (uint32_t i = 0; i < e.clips.size() && i < kMaxLayers; ++i) chosen.push_back(e.clips[i]);
@@ -345,7 +345,7 @@ struct Mixer::Impl {
                 ma_sound_set_min_distance(&l.sound, d.minDistance);
                 ma_sound_set_max_distance(&l.sound, std::max(d.maxDistance, d.minDistance + 0.01f));
             }
-            if (cursor > 0.0) { // 가상에서 돌아온 루프: 센 위치에서 잇는다
+            if (cursor > 0.0) { // a loop returning from virtual: continue from the counted position
                 ma_uint64 length = 0;
                 ma_sound_get_length_in_pcm_frames(&l.sound, &length);
                 const ma_uint32 rate = ma_engine_get_sample_rate(&engine);
@@ -360,7 +360,7 @@ struct Mixer::Impl {
         return true;
     }
 
-    // 파라미터·위치·페이드를 실제 목소리에 넣는다
+    // Puts parameters/position/fades into the real voice
     void apply(Voice& v) {
         const EventInfo& e = events[v.event];
         const EventDef& d = e.def;
@@ -373,13 +373,13 @@ struct Mixer::Impl {
         for (uint32_t i = 0; i < v.layerCount; ++i) {
             Layer& l = v.layers[i];
             float weight = 1.0f;
-            if (d.container == Container::Blend && v.layerCount > 1) { // 이웃한 두 클립을 크로스페이드
+            if (d.container == Container::Blend && v.layerCount > 1) { // crossfades two adjacent clips
                 const float at = (d.param.empty() ? 0.0f : t) * static_cast<float>(v.layerCount - 1);
                 weight = std::max(0.0f, 1.0f - std::fabs(at - static_cast<float>(i)));
             }
             ma_sound_set_volume(&l.sound, volume * weight);
             ma_sound_set_pitch(&l.sound, pitch);
-            if (d.spatial) ma_sound_set_position(&l.sound, v.position.x, v.position.y, -v.position.z); // 왼손 → miniaudio 오른손
+            if (d.spatial) ma_sound_set_position(&l.sound, v.position.x, v.position.y, -v.position.z); // left-handed → miniaudio right-handed
             if (l.lpf_ && cutoff > 0.0f && std::fabs(cutoff - l.cutoff) > 1.0f) {
                 l.cutoff = cutoff;
                 ma_lpf_config lc = ma_lpf_config_init(ma_format_f32, ma_engine_get_channels(&engine), ma_engine_get_sample_rate(&engine),
@@ -389,7 +389,7 @@ struct Mixer::Impl {
         }
     }
 
-    float estimate(Voice& v) const { // 볼륨 × 거리 감쇠 (가상 목소리·상한 판단)
+    float estimate(Voice& v) const { // volume × distance attenuation (virtual voice/limit decisions)
         const EventDef& d = events[v.event].def;
         const float t = curveT(v, d);
         float gain = d.volume * v.volumeScale * lerpf(d.volumeAtMin, d.volumeAtMax, t);
@@ -420,7 +420,7 @@ struct Mixer::Impl {
         if (d.container == Container::Switch && n > 0) {
             const float p = param(v, d.param, 0.0f);
             v.clip = static_cast<uint32_t>(std::clamp(std::lround(p), 0l, static_cast<long>(n) - 1));
-        } else if (n > 1) { // 무작위: 직전 클립은 다시 고르지 않는다
+        } else if (n > 1) { // random: the last clip isn't picked again
             v.clip = rng.below(n - 1);
             if (v.clip >= e.lastClip && e.lastClip < n) ++v.clip;
         } else {
@@ -445,7 +445,7 @@ struct Mixer::Impl {
             cull(std::string(name), "missing event");
             return {};
         }
-        if (!e->def.subtitle.empty()) { // 자막: 같은 키는 한 줄로
+        if (!e->def.subtitle.empty()) { // subtitles: same keys on one line
             auto at = std::find_if(subtitles.begin(), subtitles.end(), [&](const Subtitle& s) { return s.key == e->def.subtitle; });
             if (at != subtitles.end()) at->secondsLeft = std::max(at->secondsLeft, e->def.subtitleSeconds);
             else subtitles.push_back({e->def.subtitle, e->def.subtitleSeconds});
@@ -471,7 +471,7 @@ struct Mixer::Impl {
         return {};
     }
 
-    // 시작 대기 중인 요청: 이벤트마다 쿨다운, 동시 재생 상한(넘치면 끊을 것), 같은 프레임 묶기(세기 큰 순)
+    // Requests waiting to start: per-event cooldown, concurrency limit (what to cut on overflow), same-frame grouping (loudest first)
     void startPending() {
         std::vector<uint32_t> pending;
         for (uint32_t i = 0; i < kVoiceSlots; ++i)
@@ -500,7 +500,7 @@ struct Mixer::Impl {
                     release(v);
                     continue;
                 }
-                if (k - at >= cap) { // 한 프레임에 상한보다 많이 왔다: 세기 큰 것만
+                if (k - at >= cap) { // more than the limit arrived in one frame: only the loudest
                     cull(d.name, "same frame");
                     release(v);
                     continue;
@@ -531,7 +531,7 @@ struct Mixer::Impl {
         }
     }
 
-    // 실제로 섞을 목소리 고르기: 우선순위 × 들리는 크기. 나머지 루프는 가상(재생 위치만 센다), 짧은 소리는 끊는다
+    // Picking voices to actually mix: priority × audibility. Other loops become virtual (only the playback position is counted), short sounds are cut
     void manageVoices(double dt) {
         std::vector<uint32_t> active;
         for (uint32_t i = 0; i < kVoiceSlots; ++i) {
@@ -560,7 +560,7 @@ struct Mixer::Impl {
             const bool audible = v.audibility >= kInaudible && real < desc.maxVoices;
             if (audible) {
                 if (!v.real) {
-                    // 처음 시작이거나 가상에서 돌아온다 (짧은 소리는 처음 시작일 때만 여기로 온다)
+                    // First start, or returning from virtual (short sounds come here only on first start)
                     if (!realize(v, loop ? v.virtualCursor : 0.0)) {
                         cull(v.eventName, "missing clip");
                         release(v);
@@ -573,7 +573,7 @@ struct Mixer::Impl {
                 ++stats.realVoices;
                 continue;
             }
-            if (!loop) { // 짧은 소리는 가상으로 두지 않는다
+            if (!loop) { // short sounds aren't kept virtual
                 cull(v.eventName, v.audibility < kInaudible ? "inaudible" : "voice limit");
                 release(v);
                 continue;
@@ -602,7 +602,7 @@ bool Mixer::init(const Desc& desc) {
     m->desc.maxVoices = std::clamp(desc.maxVoices, 1u, kVoiceSlots);
     ma_engine_config config = ma_engine_config_init();
     config.listenerCount = 1;
-    config.channels = 2; // 스테레오로 섞고 장치 채널(7.1 등)로는 miniaudio가 바꾼다 (섞는 비용이 채널 수에 비례)
+    config.channels = 2; // mixed in stereo, miniaudio converts to device channels (7.1 etc.) (mixing cost scales with channel count)
     if (desc.noDevice) {
         config.noDevice = MA_TRUE;
         config.sampleRate = desc.sampleRate;
@@ -615,7 +615,7 @@ bool Mixer::init(const Desc& desc) {
     m->voices = std::make_unique<Voice[]>(kVoiceSlots);
     m->bus("master");
     for (const char* name : {"music", "sfx", "ui", "voice"}) m->bus(name);
-    m->rng.reseed(desc.seed ? desc.seed : static_cast<uint64_t>(now() * 1000.0) | 1u); // 화면용 (결정론과 무관)
+    m->rng.reseed(desc.seed ? desc.seed : static_cast<uint64_t>(now() * 1000.0) | 1u); // cosmetic (unrelated to determinism)
     setMuted(desc.muted);
     return true;
 }
@@ -627,7 +627,7 @@ void Mixer::shutdown() {
     for (auto& c : m->clips)
         if (c->decoded) ma_sound_uninit(&c->source);
     m->clips.clear();
-    for (size_t i = m->buses.size(); i-- > 0;) { // 자식 버스부터
+    for (size_t i = m->buses.size(); i-- > 0;) { // child buses first
         ma_node_uninit(&m->buses[i]->meter.base, nullptr);
         ma_sound_group_uninit(&m->buses[i]->group);
     }
@@ -701,7 +701,7 @@ void Mixer::setGlobalParam(std::string_view name, float value) {
 void Mixer::setListener(Vec3 position, Vec3 forward) {
     if (!m->ready) return;
     m->listener = position;
-    ma_engine_listener_set_position(&m->engine, 0, position.x, position.y, -position.z); // 왼손 좌표 → miniaudio 오른손
+    ma_engine_listener_set_position(&m->engine, 0, position.x, position.y, -position.z); // left-handed coordinates → miniaudio right-handed
     ma_engine_listener_set_direction(&m->engine, 0, forward.x, forward.y, -forward.z);
     ma_engine_listener_set_world_up(&m->engine, 0, 0.0f, 1.0f, 0.0f);
 }

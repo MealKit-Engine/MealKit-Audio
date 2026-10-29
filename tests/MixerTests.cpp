@@ -1,4 +1,4 @@
-// mkaudio 시험: 장치 없이(Desc::noDevice) 섞고 render()로 꺼내 본다. 클립은 시험이 만든 WAV 파일.
+// mkaudio tests: mixes without a device (Desc::noDevice) and pulls output with render(). Clips are WAV files made by the test.
 #include "mkaudio/Events.h"
 #include "mkaudio/Mixer.h"
 
@@ -22,7 +22,7 @@ int g_checks = 0;
         }                                                                                                              \
     } while (0)
 
-// 16비트 모노 사인파 WAV
+// 16-bit mono sine wave WAV
 bool writeWav(const std::string& path, double seconds, double hz, unsigned rate = 48000) {
     const unsigned frames = static_cast<unsigned>(seconds * rate);
     std::vector<short> samples(frames);
@@ -48,7 +48,7 @@ bool writeWav(const std::string& path, double seconds, double hz, unsigned rate 
     return true;
 }
 
-// 한 프레임(60 fps): update 다음 그 시간만큼 섞어 최댓값을 돌려준다
+// One frame (60 fps): update, then mix that much time and return the peak
 float frame(mkaudio::Mixer& mixer) {
     mixer.update(1.0 / 60.0);
     std::vector<float> out(800 * mixer.channels());
@@ -73,7 +73,7 @@ mkaudio::EventDef event(const char* name, const std::string& file) {
     return e;
 }
 
-// 이벤트 파일: 읽기·쓰기 왕복, 기본값은 쓰지 않는다, 틀린 줄은 메시지
+// Event files: read/write round trip, defaults aren't written, bad lines become messages
 void testEventFile() {
     const char* text = "# comment\n@format audio-events 1\n\nmixbus music\nvolume 0.5\n\nmixbus ambience\nparent music\n\n"
                        "event hit\nclips a.wav  b.wav\ncontainer blend\nparam speed\nparamMax 15\nvolumeRandom 0.15\nspatial false\nbus ambience\n"
@@ -89,16 +89,16 @@ void testEventFile() {
     CHECK(hit.steal == mkaudio::Steal::Quietest && hit.maxInstances == 3 && hit.subtitle == "sub.hit" && hit.bus == "ambience");
     size_t errors = 0, warnings = 0;
     for (const auto& m : messages) (m.error ? errors : warnings)++;
-    CHECK(errors == 3 && warnings == 1); // 겹친 이름, 틀린 이름, 틀린 값 / 모르는 키
+    CHECK(errors == 3 && warnings == 1); // duplicate name, bad name, bad value / unknown key
 
     const std::string written = mkaudio::writeEvents(f);
     CHECK(written.find("\n@format audio-events 1\n") != std::string::npos);
-    CHECK(written.find("pitch ") == std::string::npos); // 기본값은 쓰지 않는다
+    CHECK(written.find("pitch ") == std::string::npos); // defaults aren't written
     CHECK(written.find("volumeRandom 0.15\n") != std::string::npos && written.find("spatial false\n") != std::string::npos);
     mkaudio::EventFile back;
     CHECK(mkaudio::parseEvents(written, back) && mkaudio::writeEvents(back) == written);
 
-    CHECK(!mkaudio::parseEvents("@format table 1\nrow x\n", back)); // 다른 종류의 파일
+    CHECK(!mkaudio::parseEvents("@format table 1\nrow x\n", back)); // a file of another kind
     CHECK(mkaudio::saveEventFile("mkaudio_test.events", f) && mkaudio::loadEventFile("mkaudio_test.events", back) && back.events.size() == 2);
     std::remove("mkaudio_test.events");
     mkaudio::resolveClips(back, [](const std::string& name) { return name == "a.wav" ? std::string("/x/a.wav") : std::string(); });
@@ -145,29 +145,29 @@ int main() {
     mixer.setEvents(events);
     CHECK(mixer.eventNames().size() == 6 && mixer.event("cool") && mixer.event("cool")->cooldown == 10.0f);
 
-    // 재생하면 들린다, 멈추면 무효
+    // Playing is audible, stopping invalidates it
     mkaudio::Handle h = mixer.play2D("beep");
     CHECK(h.valid() && mixer.playing(h));
     CHECK(frame(mixer) > 0.05f && mixer.stats().realVoices == 1 && mixer.stats().playsThisFrame == 1);
     mixer.stop(h);
     CHECK(!mixer.playing(h));
-    frame(mixer); // 노드 그래프에 남은 한 덩어리
+    frame(mixer); // one chunk left in the node graph
     CHECK(frame(mixer) < 0.01f);
 
-    // 없는 이벤트, 없는 클립
+    // Missing events, missing clips
     CHECK(!mixer.play2D("nope").valid() && culls(mixer, "nope", "missing event") == 1);
     mixer.play2D("missing");
     frame(mixer);
     CHECK(culls(mixer, "missing", "missing clip") == 1);
 
-    // 쿨다운
+    // Cooldown
     mixer.play2D("cool");
     frame(mixer);
     mixer.play2D("cool");
     frame(mixer);
     CHECK(culls(mixer, "cool", "cooldown") == 1);
 
-    // 같은 프레임 묶기, 동시 재생 상한 (끊지 않음)
+    // Same-frame grouping, concurrency limit (no cutting)
     for (int i = 0; i < 3; ++i) mixer.play2D("cap");
     frame(mixer);
     CHECK(culls(mixer, "cap", "same frame") == 2);
@@ -176,7 +176,7 @@ int main() {
     CHECK(culls(mixer, "cap", "max instances") == 1);
     mixer.stopAll();
 
-    // 먼 루프는 가상 목소리, 가까이 가면 다시 섞는다
+    // Distant loops become virtual voices, and are mixed again when approached
     mixer.setListener({0, 0, 0}, {0, 0, 1});
     mkaudio::Handle loop = mixer.play("hum", {0, 0, 50});
     frame(mixer);
@@ -186,27 +186,27 @@ int main() {
     std::vector<mkaudio::VoiceInfo> voices;
     mixer.voices(voices);
     CHECK(voices.size() == 1 && voices[0].event == "hum" && voices[0].loop && !voices[0].virtualVoice);
-    mixer.stop(loop, 0.1f); // 페이드
+    mixer.stop(loop, 0.1f); // fade
     for (int i = 0; i < 10; ++i) frame(mixer);
     CHECK(!mixer.playing(loop));
 
-    // 자막: 소리가 들리는지와 무관하게 보인다
+    // Subtitles: shown regardless of whether the sound is audible
     mixer.setMuted(true);
     mixer.play2D("sub");
     CHECK(frame(mixer) == 0.0f);
     CHECK(mixer.subtitles().size() == 1 && mixer.subtitles()[0].key == "subtitle.beep");
     mixer.setMuted(false);
 
-    // 버스
+    // Buses
     std::vector<mkaudio::BusInfo> buses;
     mixer.buses(buses);
     CHECK(buses.size() == 5 && buses[0].name == "master" && buses[2].name == "sfx");
     mixer.setBusVolume("sfx", 0.0f);
     CHECK(mixer.busVolume("sfx") == 0.0f);
     mixer.play2D("beep");
-    frame(mixer); // 볼륨 변화가 다음 덩어리부터
+    frame(mixer); // volume changes take effect from the next chunk
     CHECK(frame(mixer) < 0.001f);
-    // 버스 정의: 부모·믹스 볼륨, 돌고 도는 부모는 master로
+    // Bus definitions: parent/mix volume, cyclic parents go to master
     mixer.setBuses({{"ambience", "music", 0.5f}, {"music", "ambience", 1.0f}});
     mixer.buses(buses);
     const auto busNamed = [&](const char* name) {
@@ -215,9 +215,9 @@ int main() {
         return mkaudio::BusInfo{};
     };
     CHECK(busNamed("ambience").parent == "music" && busNamed("ambience").mix == 0.5f);
-    CHECK(busNamed("music").parent == "master"); // music → ambience → music 고리
+    CHECK(busNamed("music").parent == "master"); // music → ambience → music cycle
 
-    // 정의를 바꾸면 재생 중인 소리는 이름으로 잇고, 없어진 이벤트는 멈춘다
+    // Changing definitions keeps playing sounds by name, and vanished events stop
     mixer.setBusVolume("sfx", 1.0f);
     mkaudio::Handle keep = mixer.play2D("beep"), gone = mixer.play2D("sub");
     frame(mixer);

@@ -7,7 +7,7 @@
 #include <string_view>
 #include <vector>
 
-// 작은 JSON 읽기 (라이브 연결의 접속 정보 파일과 응답). 객체·배열·문자열·숫자·참거짓·null
+// Small JSON reader (live connection info files and responses). Objects/arrays/strings/numbers/booleans/null
 namespace mkaudio::tool {
 
 struct Json {
@@ -47,7 +47,7 @@ private:
                 case 'n': c = '\n'; break;
                 case 't': c = '\t'; break;
                 case 'r': c = '\r'; break;
-                case 'u': // ASCII만 (엔진이 제어 문자에만 쓴다)
+                case 'u': // ASCII only (the engine uses it only for control characters)
                     c = p + 4 <= t.size() ? static_cast<char>(std::strtol(std::string(t.substr(p, 4)).c_str(), nullptr, 16)) : '?';
                     p += 4;
                     break;

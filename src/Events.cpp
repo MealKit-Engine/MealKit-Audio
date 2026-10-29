@@ -10,7 +10,7 @@
 namespace mkaudio {
 namespace {
 
-// 이벤트 키 하나: 파일 이름과 EventDef 필드
+// One event key: file name and EventDef field
 enum class Kind : uint8_t { Float, Bool, UInt, String, Clips, ContainerKind, StealKind };
 struct Key {
     const char* name;
@@ -21,7 +21,7 @@ struct Key {
     std::string EventDef::*s = nullptr;
 };
 
-// 쓰는 순서 = 이 표의 순서
+// Write order = the order of this table
 const Key kKeys[] = {
     {"clips", Kind::Clips},
     {"container", Kind::ContainerKind},
@@ -95,7 +95,7 @@ std::vector<ClipRef> splitClips(const std::string& text) {
     return out;
 }
 
-// 키 하나를 읽는다. 값이 틀리면 false
+// Reads one key. false if the value is bad
 bool setKey(EventDef& e, const Key& k, const std::string& value) {
     switch (k.kind) {
     case Kind::Float: return parseFloat(value, e.*k.f);
@@ -119,7 +119,7 @@ bool setKey(EventDef& e, const Key& k, const std::string& value) {
     return false;
 }
 
-// 기본값과 다르면 "키 값" 줄
+// A "key value" line if different from the default
 std::string keyLine(const EventDef& e, const Key& k) {
     static const EventDef d;
     std::string value;
@@ -156,7 +156,7 @@ std::string keyLine(const EventDef& e, const Key& k) {
     return std::string(k.name) + " " + value + "\n";
 }
 
-// UTF-8 경로 (C++20: u8path 대신 char8_t 문자열)
+// UTF-8 path (C++20: a char8_t string instead of u8path)
 std::filesystem::path pathOf(const std::string& utf8) { return std::filesystem::path(std::u8string(utf8.begin(), utf8.end())); }
 
 } // namespace
@@ -207,7 +207,7 @@ bool parseEvents(std::string_view text, EventFile& out, std::vector<ParseMessage
                                         " - unknown keys are ignored");
             continue;
         }
-        if (key == "event" || key == "mixbus") { // 블록 머리 ("bus"는 이벤트 안의 키라 버스 블록은 mixbus)
+        if (key == "event" || key == "mixbus") { // block header ("bus" is a key inside events, so bus blocks are mixbus)
             bool duplicate = false;
             for (const EventDef& e : out.events) duplicate = duplicate || (key == "event" && e.name == value);
             for (const BusDef& b : out.buses) duplicate = duplicate || (key == "mixbus" && b.name == value);
@@ -288,7 +288,7 @@ bool saveEventFile(const std::string& path, const EventFile& file) {
         if (!out) return false;
     }
     std::error_code ec;
-    std::filesystem::rename(temp, target, ec); // 같은 폴더라 바꿔 넣기
+    std::filesystem::rename(temp, target, ec); // same folder, so it's a swap
     if (ec) std::filesystem::remove(temp, ec);
     return !ec;
 }

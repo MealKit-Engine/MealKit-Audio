@@ -1,5 +1,5 @@
-// MealKit Audio 실행 파일: SDL3 창 + SDL_Renderer + Dear ImGui (도킹). 실제 화면은 App.
-//   MealKitAudio [--project <MealKit 프로젝트 폴더>] [--select <이벤트>] [--frames N --capture <png>]
+// MealKit Audio executable: SDL3 window + SDL_Renderer + Dear ImGui (docking). The actual screen is App.
+//   MealKitAudio [--project <MealKit project folder>] [--select <event>] [--frames N --capture <png>]
 #include "App.h"
 
 #include <SDL3/SDL.h>
@@ -14,7 +14,7 @@
 
 namespace {
 
-// 보기 좋은 시스템 글꼴 (없으면 ImGui 기본 벡터 글꼴)
+// A nice-looking system font (ImGui's default vector font if none)
 void loadFont(float size) {
     ImGuiIO& io = ImGui::GetIO();
     const char* candidates[] = {
@@ -37,7 +37,7 @@ void loadFont(float size) {
 
 int main(int argc, char** argv) {
     std::string project, capture, select;
-    long frames = 0; // --frames N: N프레임 뒤 끝낸다 (--capture로 마지막 화면을 PNG로, 문서·시험용)
+    long frames = 0; // --frames N: quit after N frames (--capture saves the last screen as PNG, for docs/tests)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--project") == 0 && i + 1 < argc) project = argv[++i];
         else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) frames = std::strtol(argv[++i], nullptr, 10);
@@ -69,7 +69,7 @@ int main(int argc, char** argv) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_DockingEnable;
-    // 창 배치는 사용자 폴더에 (프로젝트에 남기지 않는다)
+    // Window layout goes in the user folder (not left in the project)
     static std::string ini;
     if (char* pref = SDL_GetPrefPath("MealKit", "MealKit Audio")) {
         ini = std::string(pref) + "imgui.ini";
