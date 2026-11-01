@@ -66,7 +66,7 @@ The library includes no engine headers, so it can be used outside MealKit. MealK
 
 | Library | Version | License | Use |
 |---|---|---|---|
-| [miniaudio](https://github.com/mackron/miniaudio) | 0.11.25 | MIT-0 | devices, node graph, decoding, 3D |
+| [miniaudio](https://github.com/mackron/miniaudio) | 0.11.25+1df46ae (CVE-2026-32837 fix) | MIT-0 | devices, node graph, decoding, 3D |
 | [stb_vorbis](https://github.com/nothings/stb) | v1.22 (stb 2c980bb) | MIT / public domain | Ogg Vorbis streaming |
 | [SDL](https://github.com/libsdl-org/SDL) | 3.4.18 | Zlib | tool only: window, input, drawing |
 | [Dear ImGui](https://github.com/ocornut/imgui) | v1.92.9b-docking (b48d1af) | MIT | tool only: user interface |
