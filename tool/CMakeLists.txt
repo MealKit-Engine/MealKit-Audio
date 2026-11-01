@@ -18,11 +18,12 @@ add_library(mkaudio_imgui STATIC
 target_include_directories(mkaudio_imgui PUBLIC ${imgui_dir} ${imgui_dir}/backends)
 target_link_libraries(mkaudio_imgui PUBLIC SDL3::SDL3-static)
 
-add_executable(MealKitAudio WIN32 main.cpp App.h App.cpp Live.h Live.cpp Json.h)
-target_link_libraries(MealKitAudio PRIVATE mkaudio mkaudio_imgui SDL3::SDL3-static)
-if(WIN32)
-    target_link_libraries(MealKitAudio PRIVATE ws2_32)
-endif()
+# Tool contract (MealKit-Contract, copied into third_party/mkcontract with that repo's tools/vendor.ps1): live connection info + client
+set(MKCONTRACT_BUILD_TESTS OFF)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/mkcontract ${CMAKE_CURRENT_BINARY_DIR}/mkcontract)
+
+add_executable(MealKitAudio WIN32 main.cpp App.h App.cpp)
+target_link_libraries(MealKitAudio PRIVATE mkaudio mkaudio_imgui mkcontract_client SDL3::SDL3-static)
 if(MSVC)
     target_compile_options(MealKitAudio PRIVATE /W4 /permissive- /utf-8)
 else()

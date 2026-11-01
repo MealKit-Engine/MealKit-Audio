@@ -1,9 +1,10 @@
 #pragma once
 
-#include "Live.h"
-
 #include "mkaudio/Events.h"
 #include "mkaudio/Mixer.h"
+
+#include <mkcontract/Client.h>
+#include <mkcontract/Json.h>
 
 #include <cstdint>
 #include <deque>
@@ -15,6 +16,15 @@
 // MealKit Audio: authoring tool for sound designers. Edits the project's assets/sounds.events (read by the game as is),
 // previews with the runtime (mkaudio::Mixer), and plays in a running game/editor and watches state over the live connection.
 namespace mkaudio::tool {
+
+// Live connection (MealKit tool contract, MealKit-Contract mkcontract_client)
+using mkcontract::Json;
+using mkcontract::live::findInstances;
+using mkcontract::live::HttpResult;
+using mkcontract::live::Instance;
+using mkcontract::live::request;
+using mkcontract::live::urlEncode;
+inline constexpr uint32_t kLiveProtocol = mkcontract::live::kProtocol; // protocol in mealkit-tool.txt
 
 class App {
 public:

@@ -70,6 +70,7 @@ The library includes no engine headers, so it can be used outside MealKit. MealK
 | [stb_vorbis](https://github.com/nothings/stb) | v1.22 (stb 2c980bb) | MIT / public domain | Ogg Vorbis streaming |
 | [SDL](https://github.com/libsdl-org/SDL) | 3.4.18 | Zlib | tool only: window, input, drawing |
 | [Dear ImGui](https://github.com/ocornut/imgui) | v1.92.9b-docking (b48d1af) | MIT | tool only: user interface |
+| [mkcontract](https://github.com/MealKit-Engine/MealKit-Contract) | see `third_party/mkcontract/VERSION.txt` | MIT | tool only: MealKit tool contract (live connection), copied with that repo's `tools/vendor.ps1` |
 
 ## License
 
