@@ -9,6 +9,8 @@ mkaudio::Mixer mixer;
 mixer.init();
 mixer.setEvents(events);                                   // std::vector<mkaudio::EventDef>
 mixer.play("hit", {x, y, z}, {{"speed", 6.0f}});           // every frame: mixer.update(dt)
+mixer.playMusic("explore");                                // switches on the next bar
+mixer.stinger("victory", mkaudio::Quantize::Beat);
 ```
 
 The runtime (`mkaudio::Mixer`, built on [miniaudio](https://github.com/mackron/miniaudio)) handles, FMOD/Wwise style:
@@ -19,16 +21,38 @@ The runtime (`mkaudio::Mixer`, built on [miniaudio](https://github.com/mackron/m
 - instance limits with stealing (oldest, quietest, none), cooldowns, same-frame grouping
 - voice management: a cap on mixed voices, inaudible loops become virtual and resume in place
 - subtitles for sounds that carry a caption key
+- occlusion: the game reports how blocked each 3D voice is (`emitters()` → its own rays → `setOcclusion()`), the voice gets quieter and muffled
+- reverb (Freeverb) on buses that ask for it, moving smoothly to new values (`setReverb`, e.g. from reverb zones)
+- ducking (a bus goes down while another one sounds) and snapshots (sets of bus volume/low-pass, faded in and out: `setSnapshot("pause", true)`)
+- interactive music: tracks with BPM and time signature switch on the next beat or bar, scheduled to the PCM frame, with a crossfade;
+  stems that come in one by one along a parameter (`setGlobalParam("tension", x)`), stingers on the next beat/bar
 
 Events and buses live in one text file that merges in git (`mkaudio/Events.h`, in a MealKit project `assets/sounds.events`):
 
 ```text
 # MealKit audio events. Edit them in MealKit Audio or by hand
-@format audio-events 1
+@format audio-events 2
 
 mixbus ambience
 parent music
 volume 0.6
+
+mixbus music
+duckBy voice
+duckVolume 0.35
+
+mixbus sfx
+reverb true
+
+snapshot pause
+fade 0.25
+volume music 0.6
+lowpass sfx 900
+
+music explore
+stems music/explore_bass.ogg music/explore_drums.ogg
+bpm 96
+stemParam tension
 
 event hit
 clips sounds/hit_1.wav sounds/hit_2.wav sounds/hit_3.wav
@@ -41,7 +65,7 @@ volumeAtMin 0.2
 
 ## MealKit Audio (the authoring tool)
 
-`MealKitAudio` is the app sound designers use: a list of events, every setting of an event with curve and distance graphs, clips picked from the project's `assets/`, buses with parents and mix volumes and live meters, preview through the same runtime the game uses (parameter and distance sliders), undo, and a live connection to a running MealKit game or editor of the project (play the event in the game, see the game's voices and buses; saving updates the game at once).
+`MealKitAudio` is the app sound designers use: a list of events, every setting of an event with curve and distance graphs, clips picked from the project's `assets/`, buses with parents, mix volumes, reverb, ducking and live meters, music tracks (stems, tempo, transitions; preview with the stem parameter and stingers), snapshots (preview on/off) and a reverb preview, preview through the same runtime the game uses (parameter, distance and occlusion sliders), undo, and a live connection to a running MealKit game or editor of the project (play the event in the game, see the game's voices and buses; saving updates the game at once).
 
 ```sh
 build/bin/MealKitAudio --project <MealKit project folder>

@@ -61,6 +61,8 @@ private:
     void drawEventList();
     void drawEventEditor();
     void drawBuses();
+    void drawMusic();
+    void drawMix();
     void drawPreview();
     void drawLive();
     void drawQuitDialog();
@@ -97,6 +99,14 @@ private:
     Handle m_preview;
     float m_param = 0.0f;
     float m_distance = 3.0f;
+    float m_occlusion = 0.0f;
+    float m_stemParam = 0.0f;
+    ReverbParams m_reverb;
+    int m_musicSelected = -1;
+    char m_musicRename[64] = {};
+    int m_musicRenaming = -1;
+    char m_snapRename[64] = {};
+    int m_snapRenaming = -1;
 
     std::vector<Instance> m_live;
     std::vector<bool> m_liveOn;

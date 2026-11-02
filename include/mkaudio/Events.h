@@ -20,18 +20,32 @@
 //   container random
 //   volumeRandom 0.15
 //   bus sfx
-// "event <name>"/"mixbus <name>" open a block ("bus" is the key setting an event's output bus, so bus definitions are mixbus), followed by "key value" lines. Keys not written are defaults (initial values of EventDef/BusDef).
+//
+//   snapshot pause
+//   fade 0.3
+//   volume music 0.5
+//   lowpass sfx 800
+//
+//   music explore
+//   stems music/explore_base.ogg music/explore_drums.ogg
+//   bpm 96
+//   stemParam tension
+// "event <name>"/"mixbus <name>"/"snapshot <name>"/"music <name>" open a block ("bus" is the key setting an event's output bus, so bus definitions are mixbus), followed by "key value" lines. Keys not written are defaults (initial values of EventDef/BusDef).
 // Event keys are EventDef field names as is, clips are space-separated paths (relative to the user; assets-relative in MealKit), container is random/switch/blend,
-// steal is oldest/quietest/none, booleans are true/false. Writing outputs only keys differing from defaults, in a fixed key order.
+// steal is oldest/quietest/none, booleans are true/false. Snapshot lines are "volume <bus> <v>" and "lowpass <bus> <Hz>"; music keys are MusicDef
+// field names (stems are clips, transition is immediate/beat/bar). Writing outputs only keys differing from defaults, in a fixed key order.
 // When the format changes, bump kEventsFormatVersion and add a migrate for old versions on the reading side (format line of the MealKit tool contract).
+// Version 2 added occlusion, bus reverb/ducking, snapshots and music; version 1 files read as they are.
 namespace mkaudio {
 
 inline constexpr const char* kEventsFormatKind = "audio-events";
-inline constexpr uint32_t kEventsFormatVersion = 1;
+inline constexpr uint32_t kEventsFormatVersion = 2;
 
 struct EventFile {
     std::vector<BusDef> buses;
     std::vector<EventDef> events; // file order
+    std::vector<SnapshotDef> snapshots;
+    std::vector<MusicDef> music;
 };
 
 struct ParseMessage {
@@ -55,5 +69,6 @@ bool validName(std::string_view name);
 
 const char* containerName(Container c);
 const char* stealName(Steal s);
+const char* quantizeName(Quantize q);
 
 } // namespace mkaudio

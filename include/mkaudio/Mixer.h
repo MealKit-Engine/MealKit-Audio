@@ -12,6 +12,9 @@
 // Puts FMOD/Wwise-style events on top of miniaudio: plays by event name + parameters, and the runtime handles clip selection (random/switch/blend containers),
 // random volume/pitch, parameter curves (volume/pitch/lowpass), 3D attenuation, buses, concurrency limits/stealing, cooldowns, same-frame grouping,
 // and voice management (cap on actually mixed voices, inaudible loops become virtual voices).
+// Spatial: occlusion amounts per voice (the game casts the rays: emitters() → setOcclusion()), reverb on buses (Freeverb) with gradual changes (reverb zones).
+// Mix: ducking (bus A lowers bus B while it sounds), snapshots (sets of bus volume/lowpass turned on and off with a fade).
+// Interactive music: tracks with BPM/time signature, transitions at the next beat/bar scheduled to the PCM frame, stingers, stems faded by a parameter.
 // This library doesn't depend on the engine (only miniaudio/stb_vorbis/the standard library. The MealKit engine checks with tools\check_libs.ps1).
 // Where event definitions are read from (assets/sounds.table in MealKit), where clip files are found, and where logs go are decided by the user.
 // All functions are called from one thread (the game's main thread). The audio thread is run by miniaudio, and only bus meters are shared as atomics.
@@ -23,6 +26,8 @@ struct Vec3 {
 
 enum class Container : uint8_t { Random, Switch, Blend };
 enum class Steal : uint8_t { Oldest, Quietest, None };
+// Where a music transition or stinger lands: right away, the next beat, the next bar of the playing track
+enum class Quantize : uint8_t { Immediate, Beat, Bar };
 
 struct ClipRef {
     std::string name; // name used in messages (e.g. "sounds/hit_1.wav")
@@ -52,6 +57,9 @@ struct EventDef {
     float cooldown = 0.0f; // seconds
     std::string subtitle;  // subtitle key (none if empty)
     float subtitleSeconds = 2.5f;
+    // Fully occluded (setOcclusion 1): volume times this and a lowpass at this cutoff (Hz, 0 = no lowpass). Spatial events only
+    float occlusionVolume = 0.35f;
+    float occlusionLowpass = 1200.0f;
 };
 
 // Bus definition ("mixbus <name>" in the event file). Undefined bus names are created under master with volume 1
@@ -59,6 +67,48 @@ struct BusDef {
     std::string name;
     std::string parent = "master";
     float volume = 1.0f; // mix volume (sound designer). Multiplied with the player volume (setBusVolume)
+    bool reverb = false; // reverb insert on this bus (amount from setReverb / reverb zones; dry sound passes as is)
+    std::string duckBy;  // while a sound plays on this bus (or its children), this bus goes down to duckVolume
+    float duckVolume = 0.4f;
+    float duckAttack = 0.08f, duckRelease = 0.6f; // seconds to go down / come back
+};
+
+// Snapshot: bus values applied while it's on ("snapshot <name>" in the event file). Several on at once multiply volumes and take the lowest lowpass
+struct SnapshotBus {
+    std::string bus;
+    float volume = 1.0f;
+    float lowpass = 0.0f; // Hz, 0 = off
+};
+struct SnapshotDef {
+    std::string name;
+    float fade = 0.3f; // seconds to turn on/off
+    std::vector<SnapshotBus> buses;
+};
+
+// Music track ("music <name>" in the event file). Stems are clips of the same length played in sync (looping);
+// stem 0 always sounds, later stems fade in one after another as stemParam (a global parameter, e.g. tension) goes from paramMin to paramMax
+struct MusicDef {
+    std::string name;
+    std::vector<ClipRef> stems;
+    float bpm = 120.0f;
+    uint32_t beatsPerBar = 4;
+    float offset = 0.0f; // seconds before the first beat (pickup)
+    Quantize transition = Quantize::Bar; // where playMusic switches to this track when another one plays
+    float crossfade = 0.05f;             // seconds the old track fades out / this one fades in at the transition
+    std::string stemParam;
+    float paramMin = 0.0f, paramMax = 1.0f;
+    float stemFade = 1.0f; // seconds a stem takes to follow a parameter change
+    float volume = 1.0f;
+    std::string bus = "music";
+    bool loop = true;
+};
+
+// Reverb values (a reverb zone's settings). wet 0 = off
+struct ReverbParams {
+    float roomSize = 0.5f; // 0..1
+    float damping = 0.5f;  // 0..1, high frequencies die faster
+    float wet = 0.0f;      // 0..1
+    float width = 1.0f;    // 0..1 stereo
 };
 
 struct Param {
@@ -92,6 +142,27 @@ struct VoiceInfo {
     float audibility = 0.0f; // volume × distance attenuation
     float distance = 0.0f;
     double age = 0.0;
+    float occlusion = 0.0f; // current (smoothed) occlusion
+};
+// A mixed 3D voice: the game checks the line from the listener to position and passes the result to setOcclusion
+struct Emitter {
+    Handle handle;
+    Vec3 position;
+    float audibility = 0.0f;
+    float occlusion = 0.0f; // current target
+};
+struct MusicInfo {
+    std::string track; // playing (or about to start) track, empty if none
+    std::string next;  // track waiting for its transition point
+    float bpm = 0.0f;
+    uint32_t beatsPerBar = 4;
+    uint32_t bar = 0;     // from 0
+    float beat = 0.0f;    // position inside the bar (0..beatsPerBar)
+};
+struct SnapshotInfo {
+    std::string name;
+    bool on = false;
+    float weight = 0.0f; // 0..1 during the fade
 };
 struct CullInfo {
     std::string event;
@@ -104,6 +175,10 @@ struct BusInfo {
     float peak = 0.0f;   // recent output peak (0..1+)
     float mix = 1.0f;    // mix volume (BusDef)
     std::string parent;  // empty for master
+    float duck = 1.0f;     // current ducking gain
+    float snapshot = 1.0f; // current snapshot volume
+    float lowpass = 0.0f;  // current snapshot lowpass (Hz, 0 = off)
+    bool reverb = false;
 };
 // A sound with a subtitle played (same keys merge into one line and extend the time)
 struct Subtitle {
@@ -135,6 +210,9 @@ public:
     void setEvents(std::vector<EventDef> events);
     // Replaces bus definitions (parent/mix volume). Missing buses are created. Cyclic parents go under master
     void setBuses(const std::vector<BusDef>& buses);
+    // Replaces snapshot / music definitions (snapshots that are on stay on by name, the playing track keeps playing if its name remains)
+    void setSnapshots(std::vector<SnapshotDef> snapshots);
+    void setMusic(std::vector<MusicDef> tracks);
 
     // Play request. The actual start happens in update() (if the same event is played many times in one frame, up to the limit, loudest first)
     Handle play(std::string_view event, Vec3 position, std::initializer_list<Param> params = {});
@@ -144,7 +222,24 @@ public:
     void stop(Handle handle, float fadeSeconds = 0.0f);
     void stopAll();
     bool playing(Handle handle) const;
-    void setGlobalParam(std::string_view name, float value); // parameters an event couldn't find on the sound
+    void setGlobalParam(std::string_view name, float value); // parameters an event couldn't find on the sound (also music stem parameters)
+
+    // Occlusion: 3D voices being mixed (the game checks a few of them per frame) and the result for one (0 = clear .. 1 = blocked, eased in)
+    void emitters(std::vector<Emitter>& out) const;
+    void setOcclusion(Handle handle, float amount);
+    // Reverb on buses with reverb set: moves to these values over seconds (entering/leaving a reverb zone)
+    void setReverb(const ReverbParams& reverb, float seconds = 0.5f);
+    const ReverbParams& reverb() const; // target
+    void setSnapshot(std::string_view name, bool on);
+    bool snapshot(std::string_view name) const;
+
+    // Music: switches to the track at its transition point (its MusicDef::transition, or the given one). The same track again does nothing
+    void playMusic(std::string_view track);
+    void playMusic(std::string_view track, Quantize at);
+    void stopMusic(float fadeSeconds = 1.0f);
+    // A 2D event played on the next beat/bar of the music (right away if no music)
+    Handle stinger(std::string_view event, Quantize at = Quantize::Beat, std::initializer_list<Param> params = {});
+    MusicInfo music() const;
 
     void setListener(Vec3 position, Vec3 forward);
     void setBusVolume(std::string_view bus, float volume);
@@ -164,6 +259,7 @@ public:
     void voices(std::vector<VoiceInfo>& out) const;
     const std::deque<CullInfo>& culls() const;
     void buses(std::vector<BusInfo>& out) const;
+    void snapshots(std::vector<SnapshotInfo>& out) const;
     const Stats& stats() const;
     uint32_t sampleRate() const;
     uint32_t channels() const;

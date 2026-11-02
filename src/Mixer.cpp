@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <memory>
 
 namespace mkaudio {
@@ -15,6 +16,10 @@ constexpr uint32_t kVoiceSlots = 256;    // real + virtual + waiting to start
 constexpr uint32_t kMaxLayers = 4;       // number of clips a blend container plays together
 constexpr size_t kCullHistory = 64;      // record of culled sounds
 constexpr float kInaudible = 0.002f;     // below this counts as inaudible (virtual voice)
+constexpr uint32_t kMaxStems = 8;        // stems of one music track
+constexpr float kOcclusionEase = 0.12f;  // seconds occlusion takes to follow a new amount
+constexpr float kOpenCutoff = 20000.0f;  // lowpass "open" (Hz)
+constexpr double kLookahead = 0.05;      // seconds ahead music/stinger times are scheduled (the audio thread mixes in chunks)
 
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
@@ -39,41 +44,176 @@ struct Random {
     float range(float a, float b) { return a + (b - a) * (static_cast<float>(next() >> 8) / 16777216.0f); }
 };
 
-// Node that measures the peak of bus output (written by the audio thread, read by the main thread)
-struct MeterNode {
-    ma_node_base base;
-    std::atomic<float> peak{0.0f};
+// Freeverb (Jezar at Dreampoint, public domain): 8 parallel lowpass-feedback combs + 4 series allpasses per channel
+struct Comb {
+    std::vector<float> buf;
+    size_t pos = 0;
+    float store = 0.0f;
+    float process(float in, float feedback, float damp) {
+        const float out = buf[pos];
+        store = out * (1.0f - damp) + store * damp;
+        buf[pos] = in + store * feedback;
+        if (++pos >= buf.size()) pos = 0;
+        return out;
+    }
+};
+struct Allpass {
+    std::vector<float> buf;
+    size_t pos = 0;
+    float process(float in) {
+        const float b = buf[pos];
+        buf[pos] = in + b * 0.5f;
+        if (++pos >= buf.size()) pos = 0;
+        return b - in;
+    }
+};
+struct Freeverb {
+    Comb comb[2][8];
+    Allpass allpass[2][4];
+    bool allocated = false;
+    void allocate(uint32_t rate) { // tunings are for 44.1 kHz, the right channel is 23 samples longer
+        static const int combs[8] = {1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617};
+        static const int allpasses[4] = {556, 441, 341, 225};
+        const double scale = rate / 44100.0;
+        for (int c = 0; c < 2; ++c) {
+            for (int i = 0; i < 8; ++i) comb[c][i].buf.assign(static_cast<size_t>((combs[i] + 23 * c) * scale) + 1, 0.0f);
+            for (int i = 0; i < 4; ++i) allpass[c][i].buf.assign(static_cast<size_t>((allpasses[i] + 23 * c) * scale) + 1, 0.0f);
+        }
+        allocated = true;
+    }
+    void clear() {
+        for (int c = 0; c < 2; ++c) {
+            for (Comb& k : comb[c]) {
+                std::fill(k.buf.begin(), k.buf.end(), 0.0f);
+                k.store = 0.0f;
+            }
+            for (Allpass& a : allpass[c]) std::fill(a.buf.begin(), a.buf.end(), 0.0f);
+        }
+    }
 };
 
-void meterProcess(ma_node* node, const float** framesIn, ma_uint32* frameCountIn, float** framesOut, ma_uint32* frameCountOut) {
-    MeterNode* meter = reinterpret_cast<MeterNode*>(node);
+// Node after each bus: lowpass (snapshots) → reverb (buses with reverb) → peak meter.
+// The main thread writes the atomics, the audio thread keeps the rest
+struct FxNode {
+    ma_node_base base;
+    std::atomic<float> peak{0.0f};
+    std::atomic<float> cutoff{0.0f}; // Hz, 0 = off
+    std::atomic<bool> reverbOn{false};
+    std::atomic<float> wet{0.0f}, room{0.5f}, damp{0.5f}, width{1.0f};
+    uint32_t rate = 48000;
+    // audio thread only
+    float applied = 0.0f;
+    float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+    float z[2][2] = {};
+    float currentWet = 0.0f;
+    Freeverb verb;
+};
+
+void fxProcess(ma_node* node, const float** framesIn, ma_uint32* frameCountIn, float** framesOut, ma_uint32* frameCountOut) {
+    FxNode* fx = reinterpret_cast<FxNode*>(node);
     const ma_uint32 channels = ma_node_get_output_channels(node, 0);
-    if (!framesIn || !framesIn[0]) { // nothing is connected
-        std::fill(framesOut[0], framesOut[0] + *frameCountOut * channels, 0.0f);
-        return;
+    const bool input = framesIn && framesIn[0];
+    const ma_uint32 frames = input ? std::min(*frameCountIn, *frameCountOut) : *frameCountOut;
+    float* out = framesOut[0];
+    if (input) std::copy(framesIn[0], framesIn[0] + frames * channels, out);
+    else std::fill(out, out + frames * channels, 0.0f); // nothing connected (a reverb tail still rings)
+    const ma_uint32 used = std::min(channels, 2u);
+
+    // Lowpass (2-pole Butterworth, RBJ cookbook)
+    const float cutoff = fx->cutoff.load(std::memory_order_relaxed);
+    const bool lowpass = cutoff > 0.0f && cutoff < static_cast<float>(fx->rate) * 0.45f;
+    if (lowpass && std::fabs(cutoff - fx->applied) > 0.5f) {
+        if (fx->applied == 0.0f) std::memset(fx->z, 0, sizeof(fx->z));
+        fx->applied = cutoff;
+        const float w = 6.2831853f * cutoff / static_cast<float>(fx->rate);
+        const float cosw = std::cos(w), alpha = std::sin(w) / (2.0f * 0.70710678f), a0 = 1.0f + alpha;
+        fx->b0 = (1.0f - cosw) * 0.5f / a0;
+        fx->b1 = (1.0f - cosw) / a0;
+        fx->b2 = fx->b0;
+        fx->a1 = -2.0f * cosw / a0;
+        fx->a2 = (1.0f - alpha) / a0;
+    } else if (!lowpass) {
+        fx->applied = 0.0f;
     }
-    const ma_uint32 frames = std::min(*frameCountIn, *frameCountOut);
-    float peak = meter->peak.load(std::memory_order_relaxed) * 0.97f; // decays slowly
-    const ma_uint32 samples = frames * channels;
-    for (ma_uint32 i = 0; i < samples; ++i) {
-        const float s = framesIn[0][i];
-        framesOut[0][i] = s;
-        peak = std::max(peak, std::fabs(s));
+    if (lowpass)
+        for (ma_uint32 f = 0; f < frames; ++f)
+            for (ma_uint32 c = 0; c < used; ++c) { // transposed direct form II
+                float& x = out[f * channels + c];
+                const float y = fx->b0 * x + fx->z[c][0];
+                fx->z[c][0] = fx->b1 * x - fx->a1 * y + fx->z[c][1];
+                fx->z[c][1] = fx->b2 * x - fx->a2 * y;
+                x = y;
+            }
+
+    // Reverb (dry passes as is, wet is added; wet eases across the chunk)
+    const bool on = fx->reverbOn.load(std::memory_order_acquire);
+    const float targetWet = on ? fx->wet.load(std::memory_order_relaxed) : 0.0f;
+    if (on && fx->verb.allocated && frames > 0 && (targetWet > 0.0f || fx->currentWet > 0.0f)) {
+        const float feedback = fx->room.load(std::memory_order_relaxed) * 0.28f + 0.7f;
+        const float damp = fx->damp.load(std::memory_order_relaxed) * 0.4f;
+        const float width = fx->width.load(std::memory_order_relaxed);
+        const float startWet = fx->currentWet;
+        for (ma_uint32 f = 0; f < frames; ++f) {
+            const float w = startWet + (targetWet - startWet) * static_cast<float>(f + 1) / static_cast<float>(frames);
+            const float wet1 = w * 3.0f * (width * 0.5f + 0.5f), wet2 = w * 3.0f * ((1.0f - width) * 0.5f);
+            float* s = out + f * channels;
+            const float in = (s[0] + s[used - 1]) * 0.015f;
+            float lr[2] = {0.0f, 0.0f};
+            for (int c = 0; c < 2; ++c) {
+                for (Comb& k : fx->verb.comb[c]) lr[c] += k.process(in, feedback, damp);
+                for (Allpass& a : fx->verb.allpass[c]) lr[c] = a.process(lr[c]);
+            }
+            if (used == 2) {
+                s[0] += lr[0] * wet1 + lr[1] * wet2;
+                s[1] += lr[1] * wet1 + lr[0] * wet2;
+            } else {
+                s[0] += (lr[0] + lr[1]) * 0.5f * (wet1 + wet2);
+            }
+        }
+        fx->currentWet = targetWet;
+        if (targetWet == 0.0f) fx->verb.clear(); // finished fading out: an old tail doesn't come back next time
     }
-    *frameCountIn = frames;
+
+    float peak = fx->peak.load(std::memory_order_relaxed) * 0.97f; // decays slowly
+    for (ma_uint32 i = 0; i < frames * channels; ++i) peak = std::max(peak, std::fabs(out[i]));
+    fx->peak.store(peak, std::memory_order_relaxed);
+    if (input) *frameCountIn = frames;
     *frameCountOut = frames;
-    meter->peak.store(peak, std::memory_order_relaxed);
 }
 
-ma_node_vtable g_meterVtable = {meterProcess, nullptr, 1, 1, 0};
+ma_node_vtable g_fxVtable = {fxProcess, nullptr, 1, 1, MA_NODE_FLAG_CONTINUOUS_PROCESSING | MA_NODE_FLAG_ALLOW_NULL_INPUT};
 
 struct Bus {
     std::string name;
     ma_sound_group group;
-    MeterNode meter;
+    FxNode fx;
     float volume = 1.0f; // player volume
     float mix = 1.0f;    // mix volume (BusDef)
     uint32_t parent = 0; // master (0) is its own parent
+    bool reverb = false;
+    std::string duckBy;
+    float duckVolume = 0.4f, duckAttack = 0.08f, duckRelease = 0.6f;
+    float duck = 1.0f;     // current ducking gain
+    float snapshot = 1.0f; // current snapshot volume
+    float lowpass = 0.0f;  // current snapshot lowpass
+    bool busy = false;     // something sounds on it this frame (ducking trigger)
+};
+
+struct SnapshotState {
+    SnapshotDef def;
+    bool on = false;
+    float weight = 0.0f;
+};
+
+struct MusicTrack {
+    std::string name;
+    std::string bus;
+    ma_sound stems[kMaxStems];
+    float weights[kMaxStems] = {};
+    uint32_t stemCount = 0;
+    uint64_t start = 0;        // engine frame the track starts at
+    uint64_t origin = 0;       // engine frame of beat 0 (start + offset)
+    uint64_t end = UINT64_MAX; // engine frame it's silent after (stopping)
 };
 
 struct Clip {
@@ -121,6 +261,8 @@ struct Voice {
     bool fading = false;
     float audibility = 0.0f;
     float distance = 0.0f;
+    float occlusion = 0.0f, occlusionTarget = 0.0f;
+    uint64_t startAt = 0; // stinger: engine frame to start at (0 = right away)
 };
 
 float lerpf(float a, float b, float t) { return a + (b - a) * t; }
@@ -148,6 +290,11 @@ struct Mixer::Impl {
     double time = 0.0;
     std::vector<Subtitle> subtitles;
     Vec3 listener;
+    std::vector<SnapshotState> snapshots;
+    std::vector<MusicDef> music;
+    std::vector<std::unique_ptr<MusicTrack>> tracks; // in start order (the last one not stopping is the current track)
+    ReverbParams reverbFrom, reverbNow, reverbTarget;
+    float reverbElapsed = 0.0f, reverbSeconds = 0.0f;
 
     void log(LogLevel level, const std::string& text) const {
         if (desc.log) desc.log(level, text);
@@ -159,7 +306,7 @@ struct Mixer::Impl {
             if (buses[i]->name == name) return i;
         auto b = std::make_unique<Bus>();
         b->name = std::string(name);
-        // bus → meter → (master bus → master meter) → device
+        // bus → fx (lowpass, reverb, meter) → (master bus → master fx) → device
         ma_sound_group* parent = buses.empty() ? nullptr : &buses[0]->group;
         if (ma_sound_group_init(&engine, 0, parent, &b->group) != MA_SUCCESS) {
             log(LogLevel::Warn, "cannot create bus " + b->name);
@@ -167,19 +314,20 @@ struct Mixer::Impl {
         }
         const ma_uint32 channels = ma_engine_get_channels(&engine);
         ma_node_config config = ma_node_config_init();
-        config.vtable = &g_meterVtable;
+        config.vtable = &g_fxVtable;
         config.pInputChannels = &channels;
         config.pOutputChannels = &channels;
-        if (ma_node_init(ma_engine_get_node_graph(&engine), &config, nullptr, &b->meter.base) == MA_SUCCESS) {
+        b->fx.rate = ma_engine_get_sample_rate(&engine);
+        if (ma_node_init(ma_engine_get_node_graph(&engine), &config, nullptr, &b->fx.base) == MA_SUCCESS) {
             ma_node* next = parent ? static_cast<ma_node*>(parent) : ma_engine_get_endpoint(&engine);
-            ma_node_attach_output_bus(&b->group, 0, &b->meter, 0);
-            ma_node_attach_output_bus(&b->meter, 0, next, 0);
+            ma_node_attach_output_bus(&b->group, 0, &b->fx, 0);
+            ma_node_attach_output_bus(&b->fx, 0, next, 0);
         }
         buses.push_back(std::move(b));
         return static_cast<uint32_t>(buses.size() - 1);
     }
 
-    void applyBusVolume(Bus& b) { ma_sound_group_set_volume(&b.group, b.volume * b.mix); }
+    void applyBusVolume(Bus& b) { ma_sound_group_set_volume(&b.group, b.volume * b.mix * b.duck * b.snapshot); }
 
     void setBuses(const std::vector<BusDef>& defs) {
         for (const BusDef& d : defs) {
@@ -187,6 +335,13 @@ struct Mixer::Impl {
             const uint32_t index = bus(d.name);
             Bus& b = *buses[index];
             b.mix = std::max(d.volume, 0.0f);
+            b.duckBy = d.duckBy == d.name ? std::string() : d.duckBy;
+            b.duckVolume = std::clamp(d.duckVolume, 0.0f, 1.0f);
+            b.duckAttack = std::max(d.duckAttack, 0.0f);
+            b.duckRelease = std::max(d.duckRelease, 0.0f);
+            if (d.reverb && !b.fx.verb.allocated) b.fx.verb.allocate(b.fx.rate); // before reverbOn (the audio thread reads it after)
+            b.reverb = d.reverb;
+            b.fx.reverbOn.store(d.reverb, std::memory_order_release);
             applyBusVolume(b);
             if (index == 0) continue; // master is at the top
             uint32_t parent = bus(d.parent.empty() ? "master" : d.parent);
@@ -198,7 +353,7 @@ struct Mixer::Impl {
                 }
             if (parent != b.parent) {
                 b.parent = parent;
-                ma_node_attach_output_bus(&b.meter, 0, &buses[parent]->group, 0);
+                ma_node_attach_output_bus(&b.fx, 0, &buses[parent]->group, 0);
             }
         }
     }
@@ -283,6 +438,19 @@ struct Mixer::Impl {
         return range != 0.0f ? std::clamp((p - d.paramMin) / range, 0.0f, 1.0f) : 0.0f;
     }
 
+    // Lowpass of a voice: parameter curve and occlusion (the lower one). Nearly open when neither applies
+    float cutoffOf(const Voice& v, const EventDef& d, float t) const {
+        float c = (d.lowpassAtMin > 0.0f || d.lowpassAtMax > 0.0f) ? lerpf(d.lowpassAtMin, d.lowpassAtMax, t) : 0.0f;
+        if (v.spatial && d.occlusionLowpass > 0.0f && v.occlusion > 0.001f) {
+            const float o = kOpenCutoff * std::pow(std::min(d.occlusionLowpass, kOpenCutoff) / kOpenCutoff, v.occlusion); // even in octaves
+            c = c > 0.0f ? std::min(c, o) : o;
+        }
+        const float top = static_cast<float>(ma_engine_get_sample_rate(&engine)) * 0.45f;
+        return c <= 0.0f ? top : std::clamp(c, 20.0f, top);
+    }
+
+    float occlusionGain(const Voice& v, const EventDef& d) const { return v.spatial ? lerpf(1.0f, d.occlusionVolume, v.occlusion) : 1.0f; }
+
     void unrealize(Voice& v) {
         for (uint32_t i = 0; i < v.layerCount; ++i) {
             Layer& l = v.layers[i];
@@ -314,15 +482,15 @@ struct Mixer::Impl {
             if (ci == kMissing) continue;
             Clip& c = *clips[ci];
             Layer& l = v.layers[v.layerCount];
-            const bool lowpass = d.lowpassAtMin > 0.0f || d.lowpassAtMax > 0.0f;
+            const bool lowpass = d.lowpassAtMin > 0.0f || d.lowpassAtMax > 0.0f || (v.spatial && d.occlusionLowpass > 0.0f);
             ma_node* target = &buses[e.bus]->group;
             if (lowpass) {
                 const ma_uint32 channels = ma_engine_get_channels(&engine);
-                ma_lpf_node_config lc =
-                    ma_lpf_node_config_init(channels, ma_engine_get_sample_rate(&engine), std::max(d.lowpassAtMin, 20.0f), 2);
+                const float cutoff = cutoffOf(v, d, curveT(v, d));
+                ma_lpf_node_config lc = ma_lpf_node_config_init(channels, ma_engine_get_sample_rate(&engine), cutoff, 2);
                 if (ma_lpf_node_init(ma_engine_get_node_graph(&engine), &lc, nullptr, &l.lpf) == MA_SUCCESS) {
                     l.lpf_ = true;
-                    l.cutoff = std::max(d.lowpassAtMin, 20.0f);
+                    l.cutoff = cutoff;
                     ma_node_attach_output_bus(&l.lpf, 0, target, 0);
                 }
             }
@@ -356,7 +524,11 @@ struct Mixer::Impl {
         if (v.layerCount == 0) return false;
         v.real = true;
         apply(v);
-        for (uint32_t i = 0; i < v.layerCount; ++i) ma_sound_start(&v.layers[i].sound);
+        const bool later = v.startAt > ma_engine_get_time_in_pcm_frames(&engine);
+        for (uint32_t i = 0; i < v.layerCount; ++i) {
+            if (later) ma_sound_set_start_time_in_pcm_frames(&v.layers[i].sound, v.startAt);
+            ma_sound_start(&v.layers[i].sound);
+        }
         return true;
     }
 
@@ -365,11 +537,11 @@ struct Mixer::Impl {
         const EventInfo& e = events[v.event];
         const EventDef& d = e.def;
         const float t = curveT(v, d);
-        float volume = d.volume * v.volumeScale * lerpf(d.volumeAtMin, d.volumeAtMax, t);
+        float volume = d.volume * v.volumeScale * lerpf(d.volumeAtMin, d.volumeAtMax, t) * occlusionGain(v, d);
         if (v.fading)
             volume *= static_cast<float>(std::clamp((v.fadeEnd - time) / std::max(v.fadeEnd - v.fadeStart, 1e-4), 0.0, 1.0));
         const float pitch = std::max(0.01f, d.pitch * v.pitchScale * lerpf(d.pitchAtMin, d.pitchAtMax, t));
-        const float cutoff = lerpf(d.lowpassAtMin, d.lowpassAtMax, t);
+        const float cutoff = cutoffOf(v, d, t);
         for (uint32_t i = 0; i < v.layerCount; ++i) {
             Layer& l = v.layers[i];
             float weight = 1.0f;
@@ -380,10 +552,9 @@ struct Mixer::Impl {
             ma_sound_set_volume(&l.sound, volume * weight);
             ma_sound_set_pitch(&l.sound, pitch);
             if (d.spatial) ma_sound_set_position(&l.sound, v.position.x, v.position.y, -v.position.z); // left-handed → miniaudio right-handed
-            if (l.lpf_ && cutoff > 0.0f && std::fabs(cutoff - l.cutoff) > 1.0f) {
+            if (l.lpf_ && std::fabs(cutoff - l.cutoff) > 1.0f) {
                 l.cutoff = cutoff;
-                ma_lpf_config lc = ma_lpf_config_init(ma_format_f32, ma_engine_get_channels(&engine), ma_engine_get_sample_rate(&engine),
-                                                      std::max(cutoff, 20.0f), 2);
+                ma_lpf_config lc = ma_lpf_config_init(ma_format_f32, ma_engine_get_channels(&engine), ma_engine_get_sample_rate(&engine), cutoff, 2);
                 ma_lpf_node_reinit(&lc, &l.lpf);
             }
         }
@@ -392,7 +563,7 @@ struct Mixer::Impl {
     float estimate(Voice& v) const { // volume × distance attenuation (virtual voice/limit decisions)
         const EventDef& d = events[v.event].def;
         const float t = curveT(v, d);
-        float gain = d.volume * v.volumeScale * lerpf(d.volumeAtMin, d.volumeAtMax, t);
+        float gain = d.volume * v.volumeScale * lerpf(d.volumeAtMin, d.volumeAtMax, t) * occlusionGain(v, d);
         v.distance = 0.0f;
         if (d.spatial) {
             v.distance = distanceOf(v.position, listener);
@@ -465,6 +636,8 @@ struct Mixer::Impl {
             v.strength = e->def.param.empty() ? e->def.volume : param(v, e->def.param, e->def.paramMin);
             v.layerCount = 0;
             v.virtualCursor = 0.0;
+            v.occlusion = v.occlusionTarget = 0.0f;
+            v.startAt = 0;
             return handleOf(i);
         }
         cull(e->def.name, "voice limit");
@@ -541,6 +714,8 @@ struct Mixer::Impl {
                 release(v);
                 continue;
             }
+            const float step = static_cast<float>(dt) / kOcclusionEase;
+            v.occlusion += std::clamp(v.occlusionTarget - v.occlusion, -step, step);
             v.audibility = estimate(v);
             if (!v.real) v.virtualCursor += dt * events[v.event].def.pitch;
             active.push_back(i);
@@ -587,6 +762,196 @@ struct Mixer::Impl {
             ++stats.virtualVoices;
         }
     }
+
+    // ---------------------------------------------------------------- Mix: snapshots, ducking, reverb
+    void updateMix(double dt) {
+        const float fdt = static_cast<float>(dt);
+        for (SnapshotState& s : snapshots) {
+            const float step = s.def.fade > 0.0f ? fdt / s.def.fade : 1.0f;
+            s.weight = std::clamp(s.weight + (s.on ? step : -step), 0.0f, 1.0f);
+        }
+        // What sounds this frame (a voice or a track marks its bus and the parents)
+        for (auto& b : buses) b->busy = false;
+        const auto mark = [&](uint32_t index) {
+            for (uint32_t p = index;; p = buses[p]->parent) {
+                buses[p]->busy = true;
+                if (p == 0) break;
+            }
+        };
+        const uint64_t frame = engineFrame();
+        for (uint32_t i = 0; i < kVoiceSlots; ++i) {
+            const Voice& v = voices[i];
+            if (v.used && v.real && v.audibility >= kInaudible && v.startAt <= frame) mark(events[v.event].bus);
+        }
+        for (const auto& t : tracks)
+            if (t->start <= frame && frame < t->end) mark(bus(t->bus));
+        // Reverb eases toward its target
+        reverbElapsed += fdt;
+        const float k = reverbSeconds > 0.0f ? std::min(reverbElapsed / reverbSeconds, 1.0f) : 1.0f;
+        reverbNow = {lerpf(reverbFrom.roomSize, reverbTarget.roomSize, k), lerpf(reverbFrom.damping, reverbTarget.damping, k),
+                     lerpf(reverbFrom.wet, reverbTarget.wet, k), lerpf(reverbFrom.width, reverbTarget.width, k)};
+        for (auto& bp : buses) {
+            Bus& b = *bp;
+            float volume = 1.0f, lowpass = 0.0f;
+            for (const SnapshotState& s : snapshots) {
+                if (s.weight <= 0.0f) continue;
+                for (const SnapshotBus& sb : s.def.buses) {
+                    if (sb.bus != b.name) continue;
+                    volume *= lerpf(1.0f, std::max(sb.volume, 0.0f), s.weight);
+                    if (sb.lowpass > 0.0f) {
+                        const float c = kOpenCutoff * std::pow(std::min(sb.lowpass, kOpenCutoff) / kOpenCutoff, s.weight);
+                        lowpass = lowpass > 0.0f ? std::min(lowpass, c) : c;
+                    }
+                }
+            }
+            b.snapshot = volume;
+            b.lowpass = lowpass >= kOpenCutoff * 0.99f ? 0.0f : lowpass;
+            b.fx.cutoff.store(b.lowpass, std::memory_order_relaxed);
+            bool ducked = false;
+            if (!b.duckBy.empty())
+                for (const auto& o : buses)
+                    if (o->name == b.duckBy) ducked = o->busy;
+            const float depth = 1.0f - b.duckVolume;
+            if (ducked) b.duck = b.duckAttack > 0.0f ? std::max(b.duckVolume, b.duck - depth * fdt / b.duckAttack) : b.duckVolume;
+            else b.duck = b.duckRelease > 0.0f ? std::min(1.0f, b.duck + depth * fdt / b.duckRelease) : 1.0f;
+            applyBusVolume(b);
+            if (b.reverb) {
+                b.fx.wet.store(std::clamp(reverbNow.wet, 0.0f, 1.0f), std::memory_order_relaxed);
+                b.fx.room.store(std::clamp(reverbNow.roomSize, 0.0f, 1.0f), std::memory_order_relaxed);
+                b.fx.damp.store(std::clamp(reverbNow.damping, 0.0f, 1.0f), std::memory_order_relaxed);
+                b.fx.width.store(std::clamp(reverbNow.width, 0.0f, 1.0f), std::memory_order_relaxed);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- Music
+    uint64_t engineFrame() const { return ma_engine_get_time_in_pcm_frames(&engine); }
+    uint64_t lookahead() const { return static_cast<uint64_t>(kLookahead * ma_engine_get_sample_rate(&engine)); }
+    uint64_t frames(float seconds) const { return static_cast<uint64_t>(std::max(seconds, 0.0f) * ma_engine_get_sample_rate(&engine)); }
+    const MusicDef* findMusic(std::string_view name) const {
+        for (const MusicDef& d : music)
+            if (d.name == name) return &d;
+        return nullptr;
+    }
+    MusicTrack* current() const { // the last track not stopping
+        for (size_t i = tracks.size(); i-- > 0;)
+            if (tracks[i]->end == UINT64_MAX) return tracks[i].get();
+        return nullptr;
+    }
+    double beatFrames(const MusicDef& d) const { return 60.0 / std::max(d.bpm, 1.0f) * ma_engine_get_sample_rate(&engine); }
+
+    // Next beat/bar of a track after now (+ lookahead)
+    uint64_t boundary(const MusicTrack& t, Quantize at) const {
+        const uint64_t soon = engineFrame() + lookahead();
+        const MusicDef* d = findMusic(t.name);
+        if (at == Quantize::Immediate || !d) return soon;
+        if (soon <= t.origin) return t.origin;
+        const double unit = beatFrames(*d) * (at == Quantize::Bar ? std::max(d->beatsPerBar, 1u) : 1u);
+        const double n = std::ceil(static_cast<double>(soon - t.origin) / unit);
+        return t.origin + static_cast<uint64_t>(std::llround(n * unit));
+    }
+
+    float stemWeight(const MusicDef& d, uint32_t stem, uint32_t count) const {
+        if (stem == 0 || d.stemParam.empty() || count < 2) return 1.0f;
+        float p = d.paramMin;
+        for (const auto& [n, value] : globals)
+            if (n == d.stemParam) p = value;
+        const float range = d.paramMax - d.paramMin;
+        const float t = range != 0.0f ? std::clamp((p - d.paramMin) / range, 0.0f, 1.0f) : 0.0f;
+        return std::clamp(t * static_cast<float>(count - 1) - static_cast<float>(stem - 1), 0.0f, 1.0f);
+    }
+
+    void stopTrack(MusicTrack& t, uint64_t at, uint64_t fade) {
+        for (uint32_t i = 0; i < t.stemCount; ++i) ma_sound_set_stop_time_with_fade_in_pcm_frames(&t.stems[i], at + fade, fade);
+        t.end = at + fade;
+    }
+
+    void freeTrack(MusicTrack& t) {
+        for (uint32_t i = 0; i < t.stemCount; ++i) ma_sound_uninit(&t.stems[i]);
+        t.stemCount = 0;
+    }
+
+    void startTrack(const MusicDef& d, uint64_t at) {
+        auto t = std::make_unique<MusicTrack>();
+        t->name = d.name;
+        t->bus = d.bus.empty() ? "music" : d.bus;
+        t->start = at;
+        t->origin = at + frames(d.offset);
+        ma_node* target = &buses[bus(t->bus)]->group;
+        const uint64_t fade = frames(d.crossfade);
+        const uint32_t count = static_cast<uint32_t>(std::min<size_t>(d.stems.size(), kMaxStems));
+        for (uint32_t i = 0; i < count; ++i) {
+            ma_sound& s = t->stems[t->stemCount];
+            if (d.stems[i].file.empty() ||
+                ma_sound_init_from_file(&engine, d.stems[i].file.c_str(), MA_SOUND_FLAG_STREAM | MA_SOUND_FLAG_NO_SPATIALIZATION, nullptr, nullptr,
+                                        &s) != MA_SUCCESS) {
+                log(LogLevel::Warn, "music " + d.name + ": cannot open stem " + d.stems[i].name);
+                continue;
+            }
+            ma_node_attach_output_bus(&s, 0, target, 0);
+            ma_sound_set_looping(&s, d.loop);
+            t->weights[t->stemCount] = stemWeight(d, i, count);
+            ma_sound_set_volume(&s, d.volume * t->weights[t->stemCount]);
+            ma_sound_set_start_time_in_pcm_frames(&s, at);
+            if (fade > 0) ma_sound_set_fade_start_in_pcm_frames(&s, 0.0f, 1.0f, fade, at);
+            ma_sound_start(&s);
+            ++t->stemCount;
+        }
+        if (t->stemCount == 0) {
+            cull(d.name, "missing clip");
+            return;
+        }
+        tracks.push_back(std::move(t));
+    }
+
+    void playMusic(std::string_view name, const Quantize* at) {
+        const MusicDef* d = findMusic(name);
+        if (!d) {
+            cull(std::string(name), "missing music");
+            return;
+        }
+        MusicTrack* cur = current();
+        if (cur && cur->name == name) return;
+        uint64_t when = engineFrame() + lookahead();
+        if (cur && cur->start > engineFrame()) { // the current one hasn't started yet: this one takes its place
+            when = cur->start;
+            freeTrack(*cur);
+            std::erase_if(tracks, [&](const auto& t) { return t.get() == cur; });
+        } else if (cur) {
+            when = boundary(*cur, at ? *at : d->transition);
+            stopTrack(*cur, when, frames(d->crossfade));
+        }
+        startTrack(*d, when);
+    }
+
+    void stopMusic(float fadeSeconds) {
+        const uint64_t frame = engineFrame();
+        for (auto& t : tracks) {
+            if (t->end != UINT64_MAX) continue;
+            if (t->start > frame) freeTrack(*t); // not started yet
+            else stopTrack(*t, frame + lookahead(), frames(fadeSeconds));
+        }
+        std::erase_if(tracks, [](const auto& t) { return t->stemCount == 0; });
+    }
+
+    void updateMusic(double dt) {
+        const uint64_t frame = engineFrame();
+        for (auto& t : tracks) {
+            const MusicDef* d = findMusic(t->name);
+            if (!d) { // the definition vanished
+                if (t->end == UINT64_MAX) stopTrack(*t, frame, lookahead());
+                continue;
+            }
+            const float step = d->stemFade > 0.0f ? static_cast<float>(dt) / d->stemFade : 1.0f;
+            for (uint32_t i = 0; i < t->stemCount; ++i) {
+                t->weights[i] += std::clamp(stemWeight(*d, i, t->stemCount) - t->weights[i], -step, step);
+                ma_sound_set_volume(&t->stems[i], d->volume * t->weights[i]);
+            }
+        }
+        for (auto& t : tracks) // stopped tracks are freed a little after their end (the audio thread may still be mixing their last chunk)
+            if (t->end != UINT64_MAX && frame > t->end + lookahead()) freeTrack(*t);
+        std::erase_if(tracks, [](const auto& t) { return t->stemCount == 0; });
+    }
 };
 
 Mixer::Mixer() : m(new Impl()) {}
@@ -624,11 +989,13 @@ void Mixer::shutdown() {
     if (!m->ready) return;
     for (uint32_t i = 0; i < kVoiceSlots; ++i)
         if (m->voices[i].used) m->release(m->voices[i]);
+    for (auto& t : m->tracks) m->freeTrack(*t);
+    m->tracks.clear();
     for (auto& c : m->clips)
         if (c->decoded) ma_sound_uninit(&c->source);
     m->clips.clear();
     for (size_t i = m->buses.size(); i-- > 0;) { // child buses first
-        ma_node_uninit(&m->buses[i]->meter.base, nullptr);
+        ma_node_uninit(&m->buses[i]->fx.base, nullptr);
         ma_sound_group_uninit(&m->buses[i]->group);
     }
     m->buses.clear();
@@ -728,6 +1095,105 @@ bool Mixer::muted() const { return m->muted; }
 
 const std::vector<Subtitle>& Mixer::subtitles() const { return m->subtitles; }
 
+void Mixer::setSnapshots(std::vector<SnapshotDef> snapshots) {
+    std::vector<SnapshotState> next;
+    for (SnapshotDef& d : snapshots) next.push_back({std::move(d), false, 0.0f});
+    for (const SnapshotState& old : m->snapshots) { // on/fade carry over by name (also ones turned on before they were defined)
+        bool found = false;
+        for (SnapshotState& s : next)
+            if (s.def.name == old.def.name) {
+                s.on = old.on;
+                s.weight = old.weight;
+                found = true;
+            }
+        if (!found && old.on) next.push_back({{old.def.name, old.def.fade, {}}, true, old.weight});
+    }
+    m->snapshots = std::move(next);
+}
+
+void Mixer::setMusic(std::vector<MusicDef> tracks) { m->music = std::move(tracks); }
+
+void Mixer::emitters(std::vector<Emitter>& out) const {
+    out.clear();
+    if (!m->ready) return;
+    for (uint32_t i = 0; i < kVoiceSlots; ++i) {
+        const Voice& v = m->voices[i];
+        if (v.used && v.real && v.spatial) out.push_back({m->handleOf(i), v.position, v.audibility, v.occlusionTarget});
+    }
+}
+
+void Mixer::setOcclusion(Handle h, float amount) {
+    if (Voice* v = m->voiceOf(h)) v->occlusionTarget = std::clamp(amount, 0.0f, 1.0f);
+}
+
+void Mixer::setReverb(const ReverbParams& reverb, float seconds) {
+    m->reverbFrom = m->reverbNow;
+    m->reverbTarget = reverb;
+    m->reverbElapsed = 0.0f;
+    m->reverbSeconds = std::max(seconds, 0.0f);
+}
+
+const ReverbParams& Mixer::reverb() const { return m->reverbTarget; }
+
+void Mixer::setSnapshot(std::string_view name, bool on) {
+    for (SnapshotState& s : m->snapshots)
+        if (s.def.name == name) {
+            s.on = on;
+            return;
+        }
+    if (on) m->snapshots.push_back({{std::string(name), 0.3f, {}}, true, 0.0f}); // not defined (yet): kept by name
+}
+
+bool Mixer::snapshot(std::string_view name) const {
+    for (const SnapshotState& s : m->snapshots)
+        if (s.def.name == name) return s.on;
+    return false;
+}
+
+void Mixer::playMusic(std::string_view track) {
+    if (m->ready) m->playMusic(track, nullptr);
+}
+
+void Mixer::playMusic(std::string_view track, Quantize at) {
+    if (m->ready) m->playMusic(track, &at);
+}
+
+void Mixer::stopMusic(float fadeSeconds) {
+    if (m->ready) m->stopMusic(fadeSeconds);
+}
+
+Handle Mixer::stinger(std::string_view event, Quantize at, std::initializer_list<Param> params) {
+    const Handle h = m->request(event, false, {}, params);
+    Voice* v = m->voiceOf(h);
+    const MusicTrack* cur = m->current();
+    if (v && cur && at != Quantize::Immediate) v->startAt = m->boundary(*cur, at);
+    return h;
+}
+
+MusicInfo Mixer::music() const {
+    MusicInfo info;
+    if (!m->ready) return info;
+    const uint64_t frame = m->engineFrame();
+    const MusicTrack* playing = nullptr;
+    for (const auto& t : m->tracks) {
+        if (t->start <= frame && frame < t->end) playing = t.get();
+        else if (t->start > frame && t->end == UINT64_MAX) info.next = t->name;
+    }
+    if (!playing) {
+        std::swap(info.track, info.next); // only a track about to start
+        return info;
+    }
+    info.track = playing->name;
+    if (const MusicDef* d = m->findMusic(playing->name)) {
+        info.bpm = d->bpm;
+        info.beatsPerBar = std::max(d->beatsPerBar, 1u);
+        const double beats = frame > playing->origin ? static_cast<double>(frame - playing->origin) / m->beatFrames(*d) : 0.0;
+        info.bar = static_cast<uint32_t>(beats / info.beatsPerBar);
+        info.beat = static_cast<float>(std::fmod(beats, static_cast<double>(info.beatsPerBar)));
+    }
+    return info;
+}
+
 void Mixer::update(double dt) {
     if (!m->ready) return;
     const double begin = now();
@@ -737,6 +1203,8 @@ void Mixer::update(double dt) {
     m->stats.playsThisFrame = m->stats.culledThisFrame = 0;
     m->startPending();
     m->manageVoices(dt);
+    m->updateMusic(dt);
+    m->updateMix(dt);
     m->stats.updateMs = (now() - begin) * 1000.0;
 }
 
@@ -764,7 +1232,7 @@ void Mixer::voices(std::vector<VoiceInfo>& out) const {
     for (uint32_t i = 0; i < kVoiceSlots; ++i) {
         const Voice& v = m->voices[i];
         if (!v.used || v.pending) continue;
-        out.push_back({v.eventName, !v.real, m->events[v.event].def.loop, v.audibility, v.distance, m->time - v.startTime});
+        out.push_back({v.eventName, !v.real, m->events[v.event].def.loop, v.audibility, v.distance, m->time - v.startTime, v.occlusion});
     }
 }
 
@@ -774,8 +1242,14 @@ void Mixer::buses(std::vector<BusInfo>& out) const {
     out.clear();
     for (size_t i = 0; i < m->buses.size(); ++i) {
         const Bus& b = *m->buses[i];
-        out.push_back({b.name, b.volume, b.meter.peak.load(std::memory_order_relaxed), b.mix, i ? m->buses[b.parent]->name : std::string()});
+        out.push_back({b.name, b.volume, b.fx.peak.load(std::memory_order_relaxed), b.mix, i ? m->buses[b.parent]->name : std::string(), b.duck,
+                       b.snapshot, b.lowpass, b.reverb});
     }
+}
+
+void Mixer::snapshots(std::vector<SnapshotInfo>& out) const {
+    out.clear();
+    for (const SnapshotState& s : m->snapshots) out.push_back({s.def.name, s.on, s.weight});
 }
 
 const Stats& Mixer::stats() const { return m->stats; }

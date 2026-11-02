@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <sstream>
 
 namespace mkaudio::tool {
@@ -252,6 +253,8 @@ void App::applyToMixer() {
     resolveClips(resolved, [this](const std::string& name) { return resolveClip(name); });
     m_mixer.setBuses(resolved.buses);
     m_mixer.setEvents(resolved.events);
+    m_mixer.setSnapshots(resolved.snapshots);
+    m_mixer.setMusic(resolved.music);
 }
 
 void App::snapshot() {
@@ -273,6 +276,8 @@ void App::undo(bool redo) {
     from.pop_back();
     parseEvents(m_lastSnapshot, m_file);
     if (m_selected >= static_cast<int>(m_file.events.size())) m_selected = static_cast<int>(m_file.events.size()) - 1;
+    if (m_musicSelected >= static_cast<int>(m_file.music.size())) m_musicSelected = static_cast<int>(m_file.music.size()) - 1;
+    m_musicRenaming = m_snapRenaming = -1;
 }
 
 // ---------------------------------------------------------------- Every frame
@@ -307,6 +312,8 @@ void App::frame(double dt) {
         drawEventList();
         drawEventEditor();
         drawBuses();
+        drawMusic();
+        drawMix();
         drawPreview();
         drawLive();
         applyToMixer();
@@ -327,6 +334,8 @@ void App::layoutDocks(unsigned dockspace) {
     ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.45f, &rightBottom, &right);
     ImGui::DockBuilderDockWindow("Events", left);
     ImGui::DockBuilderDockWindow("Event", center);
+    ImGui::DockBuilderDockWindow("Music", center);
+    ImGui::DockBuilderDockWindow("Mix", center);
     ImGui::DockBuilderDockWindow("Preview", right);
     ImGui::DockBuilderDockWindow("Buses", rightBottom);
     ImGui::DockBuilderDockWindow("Live", rightBottom);
@@ -551,6 +560,12 @@ void App::drawEventEditor() {
         ImGui::SetNextItemWidth(260);
         ImGui::DragFloatRange2("Distance (full, silent)", &e.minDistance, &e.maxDistance, 0.1f, 0.0f, 1000.0f, "%.1f m", "%.1f m");
         attenuationPlot(e.minDistance, e.maxDistance, m_distance);
+        ImGui::SetNextItemWidth(200);
+        ImGui::SliderFloat("Behind a wall: volume", &e.occlusionVolume, 0.0f, 1.0f, "%.2f");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(160);
+        ImGui::SliderFloat("low-pass", &e.occlusionLowpass, 0.0f, 20000.0f, e.occlusionLowpass > 0.0f ? "%.0f Hz" : "off", ImGuiSliderFlags_Logarithmic);
+        ImGui::TextDisabled("The game checks a line from the listener to the sound; fully blocked uses these values.");
     }
 
     // ---- Playback
@@ -601,6 +616,58 @@ void App::drawEventEditor() {
     ImGui::End();
 }
 
+namespace {
+
+// Name field that only takes valid, unused names (renaming happens when editing ends)
+bool nameField(const char* label, std::string& name, char* buf, size_t size, int& editing, int index, const std::function<bool(const std::string&)>& taken,
+               std::string& status) {
+    if (editing != index) {
+        std::snprintf(buf, size, "%s", name.c_str());
+        editing = index;
+    }
+    ImGui::SetNextItemWidth(220);
+    if (!(ImGui::InputText(label, buf, size, ImGuiInputTextFlags_EnterReturnsTrue) || ImGui::IsItemDeactivatedAfterEdit())) return false;
+    const std::string next = buf;
+    if (next == name) return false;
+    if (validName(next) && !taken(next)) {
+        name = next;
+        return true;
+    }
+    status = taken(next) ? "Name already used: " + next : "Names use letters, digits, _ - . only";
+    std::snprintf(buf, size, "%s", name.c_str());
+    return false;
+}
+
+bool busCombo(const char* label, std::string& bus, const EventFile& file, bool allowNone) {
+    bool changed = false;
+    if (ImGui::BeginCombo(label, bus.empty() ? "(none)" : bus.c_str())) {
+        if (allowNone && ImGui::Selectable("(none)", bus.empty())) {
+            bus.clear();
+            changed = true;
+        }
+        for (const char* b : kStandardBuses)
+            if (std::string(b) != "master" && ImGui::Selectable(b, bus == b)) {
+                bus = b;
+                changed = true;
+            }
+        for (const BusDef& b : file.buses)
+            if (!std::any_of(std::begin(kStandardBuses), std::end(kStandardBuses), [&](const char* s) { return b.name == s; }) &&
+                ImGui::Selectable(b.name.c_str(), bus == b.name)) {
+                bus = b.name;
+                changed = true;
+            }
+        ImGui::EndCombo();
+    }
+    return changed;
+}
+
+// Windows added after a layout was saved (imgui.ini) open as tabs next to the Event window
+void dockWithEvent() {
+    if (const ImGuiWindow* event = ImGui::FindWindowByName("Event"); event && event->DockId) ImGui::SetNextWindowDockID(event->DockId, ImGuiCond_FirstUseEver);
+}
+
+} // namespace
+
 // ---------------------------------------------------------------- Buses
 
 void App::drawBuses() {
@@ -613,11 +680,17 @@ void App::drawBuses() {
         return 0.0f;
     };
     int removeAt = -1;
-    if (ImGui::BeginTable("##buses", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+    auto infoOf = [&](const std::string& name) {
+        for (const BusInfo& b : live)
+            if (b.name == name) return b;
+        return BusInfo{};
+    };
+    if (ImGui::BeginTable("##buses", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("Bus");
         ImGui::TableSetupColumn("Parent");
         ImGui::TableSetupColumn("Mix volume");
         ImGui::TableSetupColumn("Level");
+        ImGui::TableSetupColumn("Effects");
         ImGui::TableHeadersRow();
         auto meter = [&](const std::string& name) {
             const float p = peakOf(name);
@@ -636,6 +709,8 @@ void App::drawBuses() {
             ImGui::TextDisabled("1.00");
             ImGui::TableNextColumn();
             meter(b);
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("-");
         }
         for (size_t i = 0; i < m_file.buses.size(); ++i) {
             BusDef& b = m_file.buses[i];
@@ -665,6 +740,27 @@ void App::drawBuses() {
             ImGui::SliderFloat("##mix", &b.volume, 0.0f, 1.5f, "%.2f");
             ImGui::TableNextColumn();
             meter(b.name);
+            ImGui::TableNextColumn();
+            std::string summary = b.reverb ? "reverb" : "";
+            if (!b.duckBy.empty()) summary += (summary.empty() ? "" : ", ") + std::string("ducked by ") + b.duckBy;
+            const BusInfo now = infoOf(b.name);
+            if (now.duck < 0.999f) summary += " (now " + std::to_string(static_cast<int>(now.duck * 100.0f + 0.5f)) + "%)";
+            if (ImGui::SmallButton(summary.empty() ? "none..." : (summary + "...").c_str())) ImGui::OpenPopup("fx");
+            if (ImGui::BeginPopup("fx")) {
+                ImGui::Checkbox("Reverb (amount from reverb zones)", &b.reverb);
+                ImGui::SetNextItemWidth(140);
+                busCombo("Ducked by", b.duckBy, m_file, true);
+                if (b.duckBy == b.name) b.duckBy.clear();
+                if (!b.duckBy.empty()) {
+                    ImGui::SetNextItemWidth(160);
+                    ImGui::SliderFloat("Down to", &b.duckVolume, 0.0f, 1.0f, "%.2f");
+                    ImGui::SetNextItemWidth(160);
+                    ImGui::DragFloat("Attack", &b.duckAttack, 0.005f, 0.0f, 5.0f, "%.2f s");
+                    ImGui::SetNextItemWidth(160);
+                    ImGui::DragFloat("Release", &b.duckRelease, 0.005f, 0.0f, 10.0f, "%.2f s");
+                }
+                ImGui::EndPopup();
+            }
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -704,6 +800,7 @@ void App::drawPreview() {
     ImGui::BeginDisabled(!e);
     if (ImGui::Button("Play  (double-click an event)", ImVec2(-FLT_MIN, 0)) && e) {
         m_preview = m_mixer.play(e->name, {0, 0, m_distance}, {{e->param.c_str(), m_param}});
+        m_mixer.setOcclusion(m_preview, m_occlusion);
     }
     ImGui::EndDisabled();
     if (ImGui::Button("Stop", ImVec2(-FLT_MIN, 0))) m_mixer.stop(m_preview, 0.1f);
@@ -715,6 +812,8 @@ void App::drawPreview() {
     }
     ImGui::SetNextItemWidth(-120);
     if (ImGui::SliderFloat("Distance", &m_distance, 0.0f, 100.0f, "%.1f m")) m_mixer.setPosition(m_preview, {0, 0, m_distance});
+    ImGui::SetNextItemWidth(-120);
+    if (ImGui::SliderFloat("Occlusion", &m_occlusion, 0.0f, 1.0f, "%.2f")) m_mixer.setOcclusion(m_preview, m_occlusion);
 
     const Stats& st = m_mixer.stats();
     ImGui::SeparatorText("Voices");
@@ -727,6 +826,217 @@ void App::drawPreview() {
     const auto& culls = m_mixer.culls();
     int shown = 0;
     for (auto it = culls.rbegin(); it != culls.rend() && shown < 12; ++it, ++shown) ImGui::TextDisabled("%s  %s", it->event.c_str(), it->reason);
+    ImGui::End();
+}
+
+// ---------------------------------------------------------------- Music
+
+void App::drawMusic() {
+    dockWithEvent();
+    ImGui::Begin("Music");
+    if (ImGui::Button("+ Track")) {
+        MusicDef d;
+        int n = 1;
+        do d.name = "track" + std::to_string(n++);
+        while (std::any_of(m_file.music.begin(), m_file.music.end(), [&](const MusicDef& o) { return o.name == d.name; }));
+        m_file.music.push_back(d);
+        m_musicSelected = static_cast<int>(m_file.music.size()) - 1;
+    }
+    ImGui::SameLine();
+    const bool has = m_musicSelected >= 0 && m_musicSelected < static_cast<int>(m_file.music.size());
+    ImGui::BeginDisabled(!has);
+    if (ImGui::Button("Delete##track")) {
+        m_file.music.erase(m_file.music.begin() + m_musicSelected);
+        m_musicSelected = std::min(m_musicSelected, static_cast<int>(m_file.music.size()) - 1);
+    }
+    ImGui::EndDisabled();
+    // Track list on the left, the selected track on the right
+    ImGui::BeginChild("##tracks", ImVec2(160, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX);
+    for (int i = 0; i < static_cast<int>(m_file.music.size()); ++i)
+        if (ImGui::Selectable(m_file.music[static_cast<size_t>(i)].name.c_str(), i == m_musicSelected)) m_musicSelected = i;
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::BeginChild("##track");
+    if (m_musicSelected < 0 || m_musicSelected >= static_cast<int>(m_file.music.size())) {
+        ImGui::TextDisabled("Add a track. Game code: ctx.audio.playMusic(\"name\").");
+        ImGui::EndChild();
+        ImGui::End();
+        return;
+    }
+    MusicDef& d = m_file.music[static_cast<size_t>(m_musicSelected)];
+    if (nameField("Name##music", d.name, m_musicRename, sizeof(m_musicRename), m_musicRenaming, m_musicSelected,
+                  [&](const std::string& n) { return std::any_of(m_file.music.begin(), m_file.music.end(), [&](const MusicDef& o) { return &o != &d && o.name == n; }); },
+                  m_status))
+        m_statusTime = m_time;
+    ImGui::SameLine();
+    ImGui::TextDisabled("game code: playMusic(\"%s\")", d.name.c_str());
+
+    ImGui::SeparatorText("Stems (same length, played together)");
+    int removeAt = -1;
+    for (size_t i = 0; i < d.stems.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        if (ImGui::SmallButton("x")) removeAt = static_cast<int>(i);
+        ImGui::SameLine();
+        const bool missing = resolveClip(d.stems[i].name).empty();
+        if (missing) ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.45f, 1.0f), "%zu  %s (missing)", i, d.stems[i].name.c_str());
+        else ImGui::Text("%zu  %s%s", i, d.stems[i].name.c_str(), i == 0 ? "  (always on)" : "");
+        ImGui::PopID();
+    }
+    if (removeAt >= 0) d.stems.erase(d.stems.begin() + removeAt);
+    ImGui::SetNextItemWidth(320);
+    if (ImGui::BeginCombo("##addstem", "+ Add stem from assets/", ImGuiComboFlags_HeightLarge)) {
+        static char stemFilter[64] = {};
+        ImGui::InputTextWithHint("##sf", "Filter", stemFilter, sizeof(stemFilter));
+        for (const std::string& f : m_clipFiles) {
+            if (stemFilter[0] && f.find(stemFilter) == std::string::npos) continue;
+            if (ImGui::Selectable(f.c_str())) d.stems.push_back({f, {}});
+        }
+        ImGui::EndCombo();
+    }
+
+    ImGui::SeparatorText("Timing");
+    ImGui::SetNextItemWidth(120);
+    ImGui::DragFloat("BPM", &d.bpm, 0.5f, 20.0f, 400.0f, "%.1f");
+    d.bpm = std::max(d.bpm, 1.0f);
+    ImGui::SameLine();
+    int beats = static_cast<int>(d.beatsPerBar);
+    ImGui::SetNextItemWidth(100);
+    if (ImGui::SliderInt("Beats per bar", &beats, 1, 12)) d.beatsPerBar = static_cast<uint32_t>(beats);
+    ImGui::SetNextItemWidth(120);
+    ImGui::DragFloat("Pickup before beat 1", &d.offset, 0.005f, 0.0f, 10.0f, "%.3f s");
+    int transition = static_cast<int>(d.transition);
+    ImGui::SetNextItemWidth(120);
+    if (ImGui::Combo("Switch to this at", &transition, "once (right away)\0next beat\0next bar\0")) d.transition = static_cast<Quantize>(transition);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(100);
+    ImGui::DragFloat("Crossfade", &d.crossfade, 0.005f, 0.0f, 4.0f, "%.2f s");
+
+    ImGui::SeparatorText("Stem parameter");
+    char param[64];
+    std::snprintf(param, sizeof(param), "%s", d.stemParam.c_str());
+    ImGui::SetNextItemWidth(160);
+    if (ImGui::InputTextWithHint("Name##stemparam", "e.g. tension", param, sizeof(param))) d.stemParam = param;
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(160);
+    ImGui::DragFloatRange2("Range##stem", &d.paramMin, &d.paramMax, 0.05f);
+    ImGui::SetNextItemWidth(120);
+    ImGui::DragFloat("Stem fade", &d.stemFade, 0.01f, 0.0f, 10.0f, "%.2f s");
+    if (d.stemParam.empty()) ImGui::TextDisabled("No parameter: every stem plays. With one, stems after the first come in one by one as it rises.");
+
+    ImGui::SeparatorText("Output");
+    ImGui::SetNextItemWidth(200);
+    ImGui::SliderFloat("Volume##music", &d.volume, 0.0f, 2.0f, "%.2f");
+    ImGui::SetNextItemWidth(160);
+    busCombo("Bus##music", d.bus, m_file, false);
+    ImGui::SameLine();
+    ImGui::Checkbox("Loop##music", &d.loop);
+
+    if (m_audio) {
+        ImGui::SeparatorText("Preview");
+        if (ImGui::Button("Play")) m_mixer.playMusic(d.name);
+        ImGui::SameLine();
+        if (ImGui::Button("Stop##music")) m_mixer.stopMusic(0.5f);
+        const MusicInfo info = m_mixer.music();
+        ImGui::SameLine();
+        if (info.track.empty()) ImGui::TextDisabled("not playing");
+        else ImGui::Text("%s  bar %u  beat %.1f%s%s", info.track.c_str(), info.bar + 1, info.beat + 1.0f, info.next.empty() ? "" : "  -> ", info.next.c_str());
+        if (!d.stemParam.empty()) {
+            ImGui::SetNextItemWidth(-160);
+            if (ImGui::SliderFloat(d.stemParam.c_str(), &m_stemParam, std::min(d.paramMin, d.paramMax), std::max(d.paramMin, d.paramMax)))
+                m_mixer.setGlobalParam(d.stemParam, m_stemParam);
+        }
+        const EventDef* e = (m_selected >= 0 && m_selected < static_cast<int>(m_file.events.size())) ? &m_file.events[static_cast<size_t>(m_selected)] : nullptr;
+        ImGui::BeginDisabled(!e);
+        if (ImGui::Button(e ? ("Stinger: " + e->name + " on the next beat").c_str() : "Stinger (select an event)")) m_mixer.stinger(e->name, Quantize::Beat);
+        ImGui::SameLine();
+        if (ImGui::Button("next bar") && e) m_mixer.stinger(e->name, Quantize::Bar);
+        ImGui::EndDisabled();
+    }
+    ImGui::EndChild();
+    ImGui::End();
+}
+
+// ---------------------------------------------------------------- Mix: snapshots, reverb preview
+
+void App::drawMix() {
+    dockWithEvent();
+    ImGui::Begin("Mix");
+    ImGui::SeparatorText("Snapshots");
+    ImGui::TextDisabled("Bus values applied while a snapshot is on (game code: ctx.audio.setSnapshot(\"pause\", true)).");
+    int removeAt = -1;
+    std::vector<SnapshotInfo> live;
+    if (m_audio) m_mixer.snapshots(live);
+    for (size_t i = 0; i < m_file.snapshots.size(); ++i) {
+        SnapshotDef& s = m_file.snapshots[i];
+        ImGui::PushID(static_cast<int>(i));
+        float weight = 0.0f;
+        for (const SnapshotInfo& l : live)
+            if (l.name == s.name) weight = l.weight;
+        const bool open = ImGui::TreeNodeEx("##snap", ImGuiTreeNodeFlags_DefaultOpen, "%s", s.name.c_str());
+        ImGui::SameLine(220);
+        if (m_audio) {
+            bool on = m_mixer.snapshot(s.name);
+            if (ImGui::Checkbox("preview", &on)) m_mixer.setSnapshot(s.name, on);
+            ImGui::SameLine();
+            ImGui::ProgressBar(weight, ImVec2(80, 0), "");
+            ImGui::SameLine();
+        }
+        if (ImGui::SmallButton("delete")) removeAt = static_cast<int>(i);
+        if (open) {
+            const int index = static_cast<int>(i);
+            if (nameField("Name##snap", s.name, m_snapRename, sizeof(m_snapRename), m_snapRenaming, index,
+                          [&](const std::string& n) {
+                              return std::any_of(m_file.snapshots.begin(), m_file.snapshots.end(), [&](const SnapshotDef& o) { return &o != &s && o.name == n; });
+                          },
+                          m_status))
+                m_statusTime = m_time;
+            ImGui::SetNextItemWidth(120);
+            ImGui::DragFloat("Fade", &s.fade, 0.01f, 0.0f, 10.0f, "%.2f s");
+            int removeBus = -1;
+            for (size_t k = 0; k < s.buses.size(); ++k) {
+                SnapshotBus& sb = s.buses[k];
+                ImGui::PushID(static_cast<int>(k));
+                if (ImGui::SmallButton("x")) removeBus = static_cast<int>(k);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(110);
+                busCombo("##bus", sb.bus, m_file, false);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(140);
+                ImGui::SliderFloat("volume", &sb.volume, 0.0f, 1.5f, "%.2f");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(160);
+                ImGui::SliderFloat("lowpass", &sb.lowpass, 0.0f, 20000.0f, sb.lowpass > 0.0f ? "%.0f Hz" : "off", ImGuiSliderFlags_Logarithmic);
+                ImGui::PopID();
+            }
+            if (removeBus >= 0) s.buses.erase(s.buses.begin() + removeBus);
+            if (ImGui::SmallButton("+ bus value")) s.buses.push_back({"music", 1.0f, 0.0f});
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+    if (removeAt >= 0) m_file.snapshots.erase(m_file.snapshots.begin() + removeAt);
+    if (ImGui::Button("+ Snapshot")) {
+        SnapshotDef s;
+        int n = 1;
+        do s.name = "snapshot" + std::to_string(n++);
+        while (std::any_of(m_file.snapshots.begin(), m_file.snapshots.end(), [&](const SnapshotDef& o) { return o.name == s.name; }));
+        m_file.snapshots.push_back(s);
+    }
+
+    if (m_audio) {
+        ImGui::SeparatorText("Reverb preview");
+        ImGui::TextDisabled("Reverb values come from reverb zones in the scene. Try them here on buses with reverb on (Buses window).");
+        bool changed = false;
+        ImGui::SetNextItemWidth(200);
+        changed |= ImGui::SliderFloat("Room size", &m_reverb.roomSize, 0.0f, 1.0f, "%.2f");
+        ImGui::SetNextItemWidth(200);
+        changed |= ImGui::SliderFloat("Damping", &m_reverb.damping, 0.0f, 1.0f, "%.2f");
+        ImGui::SetNextItemWidth(200);
+        changed |= ImGui::SliderFloat("Wet", &m_reverb.wet, 0.0f, 1.0f, "%.2f");
+        ImGui::SetNextItemWidth(200);
+        changed |= ImGui::SliderFloat("Width", &m_reverb.width, 0.0f, 1.0f, "%.2f");
+        if (changed) m_mixer.setReverb(m_reverb, 0.05f);
+    }
     ImGui::End();
 }
 
