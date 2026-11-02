@@ -133,6 +133,9 @@ struct Desc {
     uint32_t sampleRate = 48000;
     uint64_t seed = 0;                                             // cosmetic randomness (from the time if 0)
     std::function<void(LogLevel level, const std::string&)> log; // writes nothing if absent
+    // Reads a whole clip file (path from resolveClips) into out; false if missing. Absent = clips are opened from disk.
+    // Set when clips live in a pack file (MealKit pack files): streamed music is read whole too
+    std::function<bool(const std::string& path, std::vector<uint8_t>& out)> readFile;
 };
 
 struct VoiceInfo {

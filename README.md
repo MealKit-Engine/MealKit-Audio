@@ -63,6 +63,8 @@ volumeAtMin 0.2
 
 `mkaudio::loadEventFile` reads it (keys left out keep their defaults) and `saveEventFile` writes it back the same way.
 
+Clip files are opened from disk by default. When they live in a pack file or memory, set `Desc::readFile` (path → whole file bytes); the mixer reads clips, streamed music included, through it.
+
 ## MealKit Audio (the authoring tool)
 
 `MealKitAudio` is the app sound designers use: a list of events, every setting of an event with curve and distance graphs, clips picked from the project's `assets/`, buses with parents, mix volumes, reverb, ducking and live meters, music tracks (stems, tempo, transitions; preview with the stem parameter and stingers), snapshots (preview on/off) and a reverb preview, preview through the same runtime the game uses (parameter, distance and occlusion sliders), undo, and a live connection to a running MealKit game or editor of the project (play the event in the game, see the game's voices and buses; saving updates the game at once).

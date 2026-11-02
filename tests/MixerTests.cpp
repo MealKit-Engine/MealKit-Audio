@@ -330,10 +330,52 @@ void testSpatialMixMusic() {
 
 } // namespace
 
+// Desc::readFile: clips come from memory (MealKit pack files), not from disk
+void testReadFile() {
+    const std::string disk = "mkaudio_test_packed.wav";
+    CHECK(writeWav(disk, 0.3, 440.0));
+    std::vector<uint8_t> bytes;
+    if (FILE* f = std::fopen(disk.c_str(), "rb")) {
+        uint8_t buffer[4096];
+        size_t n = 0;
+        while ((n = std::fread(buffer, 1, sizeof(buffer), f)) > 0) bytes.insert(bytes.end(), buffer, buffer + n);
+        std::fclose(f);
+    }
+    std::remove(disk.c_str());
+    CHECK(!bytes.empty());
+    int reads = 0;
+    mkaudio::Desc desc;
+    desc.noDevice = true;
+    desc.readFile = [&](const std::string& path, std::vector<uint8_t>& out) {
+        if (path != "pack/beep.wav") return false;
+        ++reads;
+        out = bytes;
+        return true;
+    };
+    mkaudio::Mixer mixer;
+    CHECK(mixer.init(desc));
+    std::vector<mkaudio::EventDef> events;
+    events.push_back(event("beep", "pack/beep.wav"));
+    mkaudio::EventDef stream = event("stream", "pack/beep.wav");
+    stream.stream = true;
+    events.push_back(stream);
+    events.push_back(event("gone", "pack/gone.wav"));
+    mixer.setEvents(events);
+    mixer.play2D("beep");
+    CHECK(frame(mixer) > 0.05f);
+    mixer.stopAll();
+    for (int i = 0; i < 3; ++i) frame(mixer);
+    mixer.play2D("stream");
+    CHECK(frame(mixer) > 0.05f);
+    CHECK(reads >= 2);
+    mixer.stopAll();
+}
+
 int main() {
     testEventFile();
     testEventFile2();
     testSpatialMixMusic();
+    testReadFile();
     const std::string beepFile = "mkaudio_test_beep.wav", humFile = "mkaudio_test_hum.wav";
     CHECK(writeWav(beepFile, 0.3, 440.0));
     CHECK(writeWav(humFile, 0.5, 220.0));

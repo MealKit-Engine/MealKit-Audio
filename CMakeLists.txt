@@ -4,7 +4,7 @@
 #   MKAUDIO_MINIAUDIO_DIR   folder containing miniaudio.h
 #   MKAUDIO_STB_DIR         folder containing stb_vorbis.c
 cmake_minimum_required(VERSION 3.25)
-project(mkaudio VERSION 0.3.0 LANGUAGES C CXX)
+project(mkaudio VERSION 0.3.1 LANGUAGES C CXX)
 
 if(NOT MKAUDIO_MINIAUDIO_DIR)
     set(MKAUDIO_MINIAUDIO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniaudio)

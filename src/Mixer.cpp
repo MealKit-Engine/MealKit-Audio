@@ -21,6 +21,54 @@ constexpr float kOcclusionEase = 0.12f;  // seconds occlusion takes to follow a 
 constexpr float kOpenCutoff = 20000.0f;  // lowpass "open" (Hz)
 constexpr double kLookahead = 0.05;      // seconds ahead music/stinger times are scheduled (the audio thread mixes in chunks)
 
+// Clip files through Desc::readFile (pack files): the whole file is read on open and served from memory
+struct MemoryFile {
+    std::vector<uint8_t> bytes;
+    size_t cursor = 0;
+};
+struct ReaderVfs {
+    ma_vfs_callbacks cb{}; // first member: miniaudio casts the ma_vfs* to ma_vfs_callbacks*
+    const std::function<bool(const std::string&, std::vector<uint8_t>&)>* read = nullptr;
+};
+ma_result vfsOpen(ma_vfs* vfs, const char* path, ma_uint32 mode, ma_vfs_file* file) {
+    if (!path || !file || (mode & MA_OPEN_MODE_WRITE)) return MA_INVALID_ARGS;
+    auto f = std::make_unique<MemoryFile>();
+    if (!(*static_cast<ReaderVfs*>(vfs)->read)(path, f->bytes)) return MA_DOES_NOT_EXIST;
+    *file = f.release();
+    return MA_SUCCESS;
+}
+ma_result vfsOpenW(ma_vfs*, const wchar_t*, ma_uint32, ma_vfs_file*) { return MA_NOT_IMPLEMENTED; }
+ma_result vfsClose(ma_vfs*, ma_vfs_file file) {
+    delete static_cast<MemoryFile*>(file);
+    return MA_SUCCESS;
+}
+ma_result vfsRead(ma_vfs*, ma_vfs_file file, void* dst, size_t bytes, size_t* read) {
+    MemoryFile& f = *static_cast<MemoryFile*>(file);
+    const size_t n = std::min(bytes, f.bytes.size() - f.cursor);
+    if (n) std::memcpy(dst, f.bytes.data() + f.cursor, n);
+    f.cursor += n;
+    if (read) *read = n;
+    return n == 0 && bytes > 0 ? MA_AT_END : MA_SUCCESS;
+}
+ma_result vfsWrite(ma_vfs*, ma_vfs_file, const void*, size_t, size_t*) { return MA_NOT_IMPLEMENTED; }
+ma_result vfsSeek(ma_vfs*, ma_vfs_file file, ma_int64 offset, ma_seek_origin origin) {
+    MemoryFile& f = *static_cast<MemoryFile*>(file);
+    const ma_int64 base = origin == ma_seek_origin_start ? 0 : origin == ma_seek_origin_current ? static_cast<ma_int64>(f.cursor)
+                                                                                                 : static_cast<ma_int64>(f.bytes.size());
+    const ma_int64 to = base + offset;
+    if (to < 0 || to > static_cast<ma_int64>(f.bytes.size())) return MA_BAD_SEEK;
+    f.cursor = static_cast<size_t>(to);
+    return MA_SUCCESS;
+}
+ma_result vfsTell(ma_vfs*, ma_vfs_file file, ma_int64* cursor) {
+    *cursor = static_cast<ma_int64>(static_cast<MemoryFile*>(file)->cursor);
+    return MA_SUCCESS;
+}
+ma_result vfsInfo(ma_vfs*, ma_vfs_file file, ma_file_info* info) {
+    info->sizeInBytes = static_cast<ma_uint64>(static_cast<MemoryFile*>(file)->bytes.size());
+    return MA_SUCCESS;
+}
+
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 // Cosmetic randomness (PCG32, unrelated to determinism)
@@ -276,6 +324,7 @@ float distanceOf(Vec3 a, Vec3 b) {
 
 struct Mixer::Impl {
     ma_engine engine;
+    ReaderVfs vfs; // with Desc::readFile
     bool ready = false;
     bool muted = false;
     Desc desc;
@@ -971,6 +1020,11 @@ bool Mixer::init(const Desc& desc) {
     if (desc.noDevice) {
         config.noDevice = MA_TRUE;
         config.sampleRate = desc.sampleRate;
+    }
+    if (m->desc.readFile) {
+        m->vfs.cb = {vfsOpen, vfsOpenW, vfsClose, vfsRead, vfsWrite, vfsSeek, vfsTell, vfsInfo};
+        m->vfs.read = &m->desc.readFile;
+        config.pResourceManagerVFS = &m->vfs;
     }
     if (ma_engine_init(&config, &m->engine) != MA_SUCCESS) {
         m->log(LogLevel::Warn, desc.noDevice ? "cannot start the mixer" : "no output device - running without sound");
