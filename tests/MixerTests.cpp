@@ -1,5 +1,6 @@
 // mkaudio tests: mixes without a device (Desc::noDevice) and pulls output with render(). Clips are WAV files made by the test.
 #include "mkaudio/Events.h"
+#include "mkaudio/Golden.h"
 #include "mkaudio/Mixer.h"
 
 #include <cmath>
@@ -371,7 +372,43 @@ void testReadFile() {
     mixer.stopAll();
 }
 
+// Golden renders: the same event renders the same envelope, a text round trip keeps it, and a volume change is a difference
+void testGolden() {
+    const std::string file = "mkaudio_test_golden.wav";
+    CHECK(writeWav(file, 0.4, 330.0));
+    mkaudio::EventFile events;
+    events.events.push_back(event("tone", file));
+    mkaudio::EventDef loop = event("drone", file);
+    loop.loop = true;
+    events.events.push_back(loop);
+    mkaudio::Envelope a, b;
+    std::string error;
+    CHECK(mkaudio::renderEnvelope(events, "tone", a, error));
+    CHECK(mkaudio::renderEnvelope(events, "tone", b, error));
+    // 0.4 s of tone = 40 blocks of 10 ms (a frame or two of start/stop slack)
+    CHECK(a.rms.size() >= 38 && a.rms.size() <= 46 && a.rms[10] > -20.0f && a.rms[10] < -3.0f);
+    CHECK(mkaudio::compareEnvelopes(a, b).same);
+    mkaudio::Envelope parsed;
+    CHECK(mkaudio::parseEnvelope(mkaudio::writeEnvelope(a), parsed, error) && parsed.event == "tone" && parsed.rms == a.rms &&
+          parsed.peak == a.peak);
+    CHECK(!mkaudio::parseEnvelope("rms 1 2\n", parsed, error)); // no format line
+
+    events.events[0].volume = 0.5f; // -6 dB
+    CHECK(mkaudio::renderEnvelope(events, "tone", b, error));
+    const mkaudio::GoldenDiff quieter = mkaudio::compareEnvelopes(a, b);
+    CHECK(!quieter.same && quieter.reason.find("rms at") == 0);
+    b = a;
+    b.rms.resize(a.rms.size() / 2);
+    b.peak.resize(a.peak.size() / 2);
+    CHECK(mkaudio::compareEnvelopes(a, b).reason.find("length") == 0);
+
+    CHECK(mkaudio::renderEnvelope(events, "drone", b, error) && b.rms.size() >= 195 && b.rms.size() <= 230); // loops: 2 s (+ fade)
+    CHECK(!mkaudio::renderEnvelope(events, "nope", b, error));
+    std::remove(file.c_str());
+}
+
 int main() {
+    testGolden();
     testEventFile();
     testEventFile2();
     testSpatialMixMusic();

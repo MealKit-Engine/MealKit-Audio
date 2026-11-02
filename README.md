@@ -73,6 +73,8 @@ Clip files are opened from disk by default. When they live in a pack file or mem
 build/bin/MealKitAudio --project <MealKit project folder>
 ```
 
+Golden render tests: `MealKitAudio --golden --project <folder>` renders every event alone without a device (2D, fixed seed, parameters at their defaults) and compares its loudness over time (rms and peak per 10 ms, in dB) with `<project>/tests/audio/<event>.golden`, within 1.5 dB above -60 dB, so a changed clip, curve or bus fails while float noise between compilers does not. A missing file is written; `--update` rewrites them after an intended change, `--event <name>` runs one. It prints `GOLDEN ok|new|updated|FAIL <event>` and exits with 1 on a failure. The library side is `mkaudio/Golden.h` (`renderEnvelope`, `compareEnvelopes`).
+
 The MealKit editor lists it in its **Tools** menu when the folder with `MealKitAudio` and `mealkit-tool.txt` is in `%LOCALAPPDATA%\MealKit\tools\` (or pass `--tool-path build/bin` to the editor). Built with SDL3 and Dear ImGui.
 
 ## Build

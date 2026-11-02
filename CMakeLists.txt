@@ -4,7 +4,7 @@
 #   MKAUDIO_MINIAUDIO_DIR   folder containing miniaudio.h
 #   MKAUDIO_STB_DIR         folder containing stb_vorbis.c
 cmake_minimum_required(VERSION 3.25)
-project(mkaudio VERSION 0.3.1 LANGUAGES C CXX)
+project(mkaudio VERSION 0.4.0 LANGUAGES C CXX)
 
 if(NOT MKAUDIO_MINIAUDIO_DIR)
     set(MKAUDIO_MINIAUDIO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniaudio)
@@ -18,7 +18,9 @@ option(MKAUDIO_BUILD_TOOL "Build the MealKitAudio authoring tool (SDL3 + Dear Im
 add_library(mkaudio STATIC
     include/mkaudio/Mixer.h
     include/mkaudio/Events.h
+    include/mkaudio/Golden.h
     src/Mixer.cpp
+    src/Golden.cpp
     src/Events.cpp
     src/MiniaudioConfig.h
     src/MiniaudioImpl.cpp)
