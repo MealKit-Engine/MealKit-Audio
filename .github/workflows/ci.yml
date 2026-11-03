@@ -21,9 +21,14 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/checkout@v7
+      - name: MSVC environment
         if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # vcvars64 into the job environment (replaces ilammy/msvc-dev-cmd, which still runs on Node 20)
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | Where-Object { $_ -match '^[^=]+=' } | Out-File $env:GITHUB_ENV -Append -Encoding utf8
       - name: Linux packages (SDL3 window for the tool)
         if: runner.os == 'Linux'
         run: |
